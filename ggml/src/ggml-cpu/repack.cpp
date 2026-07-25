@@ -4469,12 +4469,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         ggml_barrier(params->threadpool);
 
         // compute each matrix multiplication in sequence
+        // temporal timeline: this kernel replaces the custom mul_mat_id when experts live
+        // in CPU_REPACK, so it must emit the same per-expert GEMV spans or the trace shows
+        // fetches with no compute. Layer id comes from the tensor name ("blk.<n>.").
+        const int tm_trace = ggml_tm_trace_on();
+        int tm_layer = -1;
+        if (tm_trace && src0->name[0]) { sscanf(src0->name, "blk.%d.", &tm_layer); }
+
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             if (cne1 == 0) {
                 continue;
             }
+            // residency barrier: this kernel replaces the pool-aware custom mul_mat_id,
+            // so it must wait for a streamed expert itself before touching its weights.
+            ggml_tm_wait_src_expert(src0, cur_a, ith);
+            const double tm_t0 = tm_trace ? ggml_tm_trace_now() : 0.0;
 
             const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
 
@@ -4511,6 +4522,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+            }
+            if (tm_trace) {
+                ggml_tm_trace_gemv(tm_t0, ggml_tm_trace_now() - tm_t0, ith, tm_layer, cur_a);
             }
         }
 #undef MMID_MATRIX_ROW
@@ -4833,4 +4847,31 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+// ---- temporal slot-pool: pre-repack helper --------------------------------
+// Repack raw Q4_0 tensor bytes into this CPU's optimal interleaved layout,
+// byte-identical to what CPU_REPACK's set_tensor produces at load time. Used
+// offline to build a repacked side-file the pool streams from, so streamed
+// experts take mul_mat_id's fast (repacked) GEMM path. dst and src are the
+// same size (repack is a lossless permutation). nrows = ne1*ne2*ne3 flattened,
+// matching ggml_nrows() at load, so the bytes match a 3D expert tensor exactly.
+// Returns 0 on success, <0 if this CPU has no repack for these dims.
+extern "C" int ggml_temporal_repack_q4_0(void * dst, const void * src, int64_t ne0, int64_t nrows) {
+    struct ggml_tensor t;
+    memset(&t, 0, sizeof(t));
+    t.type  = GGML_TYPE_Q4_0;
+    t.ne[0] = ne0; t.ne[1] = nrows; t.ne[2] = 1; t.ne[3] = 1;
+    t.nb[0] = ggml_type_size(GGML_TYPE_Q4_0);
+    t.nb[1] = (size_t) (ne0 / QK4_0) * t.nb[0];
+    t.nb[2] = t.nb[1] * nrows;
+    t.nb[3] = t.nb[2];
+    t.data  = dst;
+    const ggml::cpu::tensor_traits * tr = ggml_repack_get_optimal_repack_type(&t);
+    if (!tr) {
+        return -1;
+    }
+    auto * rt = (ggml::cpu::repack::tensor_traits_base *) const_cast<ggml::cpu::tensor_traits *>(tr);
+    size_t size = (size_t) nrows * (ne0 / QK4_0) * ggml_type_size(GGML_TYPE_Q4_0);
+    return rt->repack(&t, src, size);
 }

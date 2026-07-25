@@ -2296,6 +2296,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    // temporal two-pass splits each expert FFN into two sub-passes and inserts a wait
+    // barrier per layer -- roughly doubles the per-layer node count. Give it headroom.
+    if (getenv("LLAMA_TEMPORAL_TWOPASS")) { res *= 2; }
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }

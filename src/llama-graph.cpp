@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-cpu.h"   // ggml_temporal_window_fill (two-pass enforce window op)
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1917,6 +1919,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // temporal two-pass: replace the (degenerate) router selection with the enforced
+    // resident window, materialized here (new expert pinned to slot n_expert_used-1) so
+    // the FFN below can split into a resident sub-pass and a new-expert sub-pass.
+    static const bool tm_twopass = getenv("LLAMA_TEMPORAL_TWOPASS") != nullptr;
+    const bool tm_tp_here = tm_twopass && n_tokens == 1 && il >= 0
+        && gate_exps && down_exps && !gate_up_exps && type_op == LLM_FFN_SILU;
+    if (tm_tp_here) {
+        selected_experts = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens, 1, 1,
+                &cur, 1, ggml_temporal_window_fill, 1, (void *)(intptr_t) il);
+        cb(selected_experts, "ffn_moe_window", il);
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1959,6 +1973,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // temporal two-pass split: run the FFN twice through the *same* mul_mat_id kernel --
+    // once for the K-1 resident experts (never stalls) and once for the 1 new expert
+    // (waits only for the leftover fetch time). weights are already normalized over the
+    // full K window, then sliced. Output = out_resident + out_new. Bit-identical kernel.
+    if (tm_tp_here) {
+        ggml_tensor * curin = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+        auto one_pass = [&](int64_t off, int64_t nu, bool wait_new) -> ggml_tensor * {
+            ggml_tensor * sel = ggml_cont(ctx0, ggml_view_2d(ctx0, selected_experts, nu, n_tokens,
+                    selected_experts->nb[1], off * selected_experts->nb[0]));
+            // Both sub-passes need a fetch barrier (kernel-agnostic; the repacked
+            // mul_mat_id has no pool wait of its own). mode 1 = the new expert, mode 0 =
+            // the resident window -- free in steady state, but required on the first
+            // token when the whole window is still streaming. Passes ids through.
+            {
+                const intptr_t ud = (intptr_t) il | ((intptr_t)(wait_new ? 1 : 0) << 16);
+                sel = ggml_custom_4d(ctx0, GGML_TYPE_I32, nu, n_tokens, 1, 1,
+                        &sel, 1, ggml_temporal_wait_new, 1, (void *) ud);
+            }
+            ggml_tensor * up1 = build_lora_mm_id(up_exps,   curin, sel, up_exps_s);
+            ggml_tensor * ga1 = build_lora_mm_id(gate_exps, curin, sel, gate_exps_s);
+            ggml_tensor * ac1 = ggml_swiglu_split(ctx0, ga1, up1);
+            ggml_tensor * dn1 = build_lora_mm_id(down_exps, ac1, sel, down_exps_s); // [n_embd, nu, n_tokens]
+            ggml_tensor * w1  = ggml_view_3d(ctx0, weights, 1, nu, n_tokens,
+                    weights->nb[1], weights->nb[2], off * weights->nb[1]);
+            dn1 = ggml_mul(ctx0, dn1, w1);
+            ggml_tensor * o = ggml_view_2d(ctx0, dn1, n_embd, n_tokens, dn1->nb[2], 0);
+            for (int64_t i = 1; i < nu; ++i) {
+                o = ggml_add(ctx0, o, ggml_view_2d(ctx0, dn1, n_embd, n_tokens, dn1->nb[2], i * dn1->nb[1]));
+            }
+            return o;
+        };
+        ggml_tensor * outA = one_pass(0, n_expert_used - 1, false); // resident sub-pass
+        ggml_tensor * outB = one_pass(n_expert_used - 1, 1, true);  // new-expert sub-pass (waits)
+        ggml_tensor * moe_out = ggml_cont(ctx0, ggml_add(ctx0, outA, outB));
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

@@ -2,8 +2,14 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-cpu.h"   // ggml_temporal_pool_register (expert slot-pool)
 #include "gguf.h"
 #include "llama-hparams.h"
+
+#if defined(__linux__)
+#include <fcntl.h>   // open() the repacked expert side-file for the temporal pool
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -12,6 +18,261 @@
 #include <cstring>
 #include <future>
 #include <regex>
+
+#if defined(_POSIX_MAPPED_FILES) || defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>   // posix_madvise, for the LLAMA_TEMPORAL_MMAP=2 per-tensor policy
+#include <fcntl.h>      // posix_fadvise: the second half of a real eviction
+#include <unistd.h>     // dup: the controller outlives the loader's fd
+#include <cstring>      // strerror
+#include <atomic>
+#include <random>
+#include <thread>
+#include <vector>
+#include <algorithm>
+
+// ---------------------------------------------------------------------------
+// Forced expert eviction -- the Android analogue of the CUDA TEMPORAL_SWAP_PROB path.
+//
+// Why this exists. On a random-weight model the router has almost no diversity, so the
+// same experts are selected every token and the natural page-fault rate is
+// unrepresentative (the CUDA side hit this too, which is why it drives swaps at a
+// prescribed rate via TEMPORAL_SWAP_PROB instead of trusting the router). Measuring
+// "temporal residency" against that workload measures a fixed slice staying cached.
+//
+// So we force the turnover instead of hoping for it: a background thread evicts randomly
+// chosen expert slices at a prescribed rate with madvise(MADV_DONTNEED), which drops the
+// clean file-backed pages and makes the next use of that expert a real fault from UFS.
+// That reproduces the mechanism under test -- stream ~1 expert/layer/token -- without
+// depending on routing behaviour the model cannot produce.
+//
+// NOTE: this must be madvise(MADV_DONTNEED), not posix_madvise(POSIX_MADV_DONTNEED),
+// which is a documented no-op on Linux and would have silently evicted nothing.
+//
+//   LLAMA_TEMPORAL_EVICT_HZ=<n>  expert slices to evict per second (0/unset = off)
+namespace {
+struct expert_region { uint8_t * addr; size_t expert_bytes; int n_experts; size_t file_off; int fd; };
+std::vector<expert_region> g_expert_regions;
+// Attention / norm / embedding weights. These are touched on EVERY token, so they must be
+// resident in ALL three regimes -- only expert residency is supposed to vary. Without
+// re-asserting them the kernel reclaims them under memory pressure and the "streamed
+// experts" regime silently becomes "stream everything", making decode slow for the wrong
+// reason. Observed: R=0 gave 9.52% file residency, BELOW the 18.5% the non-expert weights
+// alone occupy, i.e. attention was being evicted and the measurement was invalid.
+struct hot_region { uint8_t * addr; size_t bytes; };
+std::vector<hot_region>    g_hot_regions;
+std::atomic<long>          g_hot_resident_pages{0};
+std::atomic<long>          g_hot_total_pages{0};
+std::atomic<bool>          g_evictor_started{false};
+std::atomic<long>          g_evictions{0};
+std::atomic<long>          g_evicted_bytes{0};
+}
+
+void llama_temporal_register_hot(uint8_t * addr, size_t bytes) {
+    g_hot_regions.push_back({addr, bytes});
+}
+
+extern "C" void llama_temporal_hot_residency(long * resident, long * total) {
+    if (resident) *resident = g_hot_resident_pages.load();
+    if (total)    *total    = g_hot_total_pages.load();
+}
+
+extern "C" void llama_temporal_evict_stats(long * n, long * bytes) {
+    if (n)     *n     = g_evictions.load();
+    if (bytes) *bytes = g_evicted_bytes.load();
+}
+
+void llama_temporal_register_experts(uint8_t * addr, size_t total_bytes, int n_experts,
+                                     size_t file_off, int fd) {
+    if (n_experts <= 1) return;
+    // dup() the fd. The one passed in belongs to the loader's llama_file, which is
+    // destroyed (fd closed) as soon as load finishes -- but the controller thread runs
+    // for the process lifetime. fadvise on the dead fd fails EBADF, and since madvise
+    // alone drops nothing from the page cache, eviction silently degrades to the exact
+    // no-op of §4. This is why the R=0 "streamed" regime decoded at 12.7 tok/s against
+    // a 3.75 tok/s storage roofline: nothing was being evicted.
+    int own = dup(fd);
+    if (own < 0) return;
+    g_expert_regions.push_back({addr, total_bytes / (size_t) n_experts, n_experts, file_off, own});
+}
+
+// Real eviction requires BOTH calls, in this order. Measured on-device:
+//   madvise(MADV_DONTNEED) alone  -> next touch reads 0 B from disk (page stayed in cache)
+//   fadvise(DONTNEED) alone       -> refused while the range is mapped, 0 B
+//   madvise THEN fadvise          -> next touch reads exactly the slice size from disk
+// Using either one alone silently evicts nothing, which is what the first version of this
+// controller did.
+static void evict_range(uint8_t * addr, size_t len, int fd, size_t file_off) {
+    uint8_t * al  = (uint8_t *) ((uintptr_t) addr & ~(uintptr_t) 4095);
+    size_t    fo  = file_off & ~(size_t) 4095;
+    // fadvise(DONTNEED) only drops pages FULLY covered by [offset, offset+len): the
+    // kernel rounds the start up and the end down. fo is aligned down, so the start is
+    // exact; the end must be rounded UP or the tail page silently survives.
+    size_t    flen = (((file_off + len + 4095) & ~(size_t) 4095)) - fo;
+    unsigned char probe[1];
+    if (mincore(al, 4096, probe) != 0) return;      // range no longer mapped
+    madvise(al, (size_t)(addr + len - al), MADV_DONTNEED);   // 1. drop our PTEs (kernel rounds len up)
+    int rc = posix_fadvise(fd, (off_t) fo, (off_t) flen, POSIX_FADV_DONTNEED);   // 2. drop page cache
+    if (rc != 0) {
+        // A failing fadvise means eviction has silently degraded to the §4 madvise-only
+        // no-op and every regime number is void. Loud, once.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("temporal: posix_fadvise(DONTNEED) FAILED: %s -- eviction is NOT happening\n",
+                           strerror(rc));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic expert residency control -- the three regimes.
+//
+// Rate-based random eviction gives statistical turnover, not control: it cannot express
+// "exactly R of E experts are resident". These are the regimes we actually need:
+//
+//   LLAMA_TEMPORAL_R=0        streamed   -- no experts resident; every use faults from UFS
+//   LLAMA_TEMPORAL_R=<E>      resident   -- all experts held; the ceiling
+//   LLAMA_TEMPORAL_R=<k>      temporal   -- a rolling window of k experts resident
+//   LLAMA_TEMPORAL_ROLL_HZ=<n>           -- window advances n times/s (0 = static window)
+//
+// Enforcement, and its honest limit. `ulimit -l` on this device is 64 KiB, so mlock()
+// cannot pin gigabytes and residency CANNOT be hard-guaranteed. Instead a controller
+// thread continuously re-asserts the target: MADV_DONTNEED on everything outside the
+// window (a hard drop of clean file pages) and MADV_WILLNEED on everything inside it.
+// The resident set is a CONTIGUOUS window, so enforcing a region costs at most three
+// madvise calls rather than one per expert.
+//
+// Because enforcement is best-effort, achieved residency is MEASURED with mincore() and
+// reported -- never assumed to equal the requested R.
+namespace {
+std::atomic<long> g_resident_pages{0};
+std::atomic<long> g_expert_pages{0};
+}
+
+extern "C" void llama_temporal_residency(long * resident, long * total) {
+    if (resident) *resident = g_resident_pages.load();
+    if (total)    *total    = g_expert_pages.load();
+}
+
+static void llama_temporal_start_residency_controller() {
+    const char * rs = getenv("LLAMA_TEMPORAL_R");
+    if (!rs || g_expert_regions.empty() || g_evictor_started.exchange(true)) return;
+    const int    R    = atoi(rs);
+    const char * hs   = getenv("LLAMA_TEMPORAL_ROLL_HZ");
+    const double roll = hs ? atof(hs) : 0.0;
+
+    const int E = g_expert_regions[0].n_experts;
+    LLAMA_LOG_INFO("%s: residency control R=%d of E=%d, roll=%.1f Hz, %zu regions\n",
+                   __func__, R, E, roll, g_expert_regions.size());
+
+    const std::vector<expert_region> regions = g_expert_regions;
+    const std::vector<hot_region>    hot     = g_hot_regions;
+    LLAMA_LOG_INFO("%s: holding %zu hot (attn/norm/embed) regions resident in all regimes\n",
+                   __func__, hot.size());
+    std::thread([regions, hot, R, roll, E]() {
+        const auto interval = std::chrono::duration<double>(roll > 0 ? 1.0 / roll : 0.05);
+        size_t w = 0;
+        for (;;) {
+            // Hot weights are re-asserted every pass in EVERY regime, so the only thing
+            // that varies between streamed / temporal / resident is expert residency.
+            long hot_res = 0, hot_tot = 0;
+            for (const auto & h : hot) {
+                uint8_t * al = (uint8_t *)((uintptr_t) h.addr & ~(uintptr_t) 4095);
+                unsigned char probe[1];
+                if (mincore(al, 4096, probe) != 0) continue;
+                madvise(al, h.bytes, MADV_WILLNEED);
+                std::vector<unsigned char> v((h.bytes + 4095) / 4096);
+                if (mincore(al, h.bytes, v.data()) == 0) {
+                    for (unsigned char c : v) hot_res += (c & 1);
+                    hot_tot += (long) v.size();
+                }
+            }
+            g_hot_resident_pages = hot_res;
+            g_hot_total_pages    = hot_tot;
+
+            long res = 0, tot = 0;
+            for (const auto & r : regions) {
+                const size_t lo = w, hi = std::min<size_t>(w + R, r.n_experts);
+                auto slice = [&](size_t a, size_t b, int advice) {
+                    if (b <= a) return;
+                    uint8_t * p   = r.addr + a * r.expert_bytes;
+                    size_t    len = (b - a) * r.expert_bytes;
+                    if (advice == MADV_DONTNEED) {
+                        evict_range(p, len, r.fd, r.file_off + a * r.expert_bytes);
+                    } else {
+                        uint8_t * al = (uint8_t *)((uintptr_t) p & ~(uintptr_t) 4095);
+                        unsigned char probe[1];
+                        if (mincore(al, 4096, probe) != 0) return;
+                        madvise(al, len, advice);
+                    }
+                };
+                slice(0,  lo,           MADV_DONTNEED);          // outside window: drop
+                slice(hi, r.n_experts,  MADV_DONTNEED);
+                slice(lo, hi,           MADV_WILLNEED);          // inside window: fetch
+                if (R > 0) { g_evictions++; }
+                tot += (long)(r.expert_bytes * r.n_experts / 4096);
+            }
+            // measure what we ACTUALLY achieved, rather than trusting the advice
+            for (const auto & r : regions) {
+                std::vector<unsigned char> vec((r.expert_bytes * r.n_experts + 4095) / 4096);
+                uint8_t * al = (uint8_t *)((uintptr_t) r.addr & ~(uintptr_t) 4095);
+                if (mincore(al, r.expert_bytes * r.n_experts, vec.data()) == 0) {
+                    for (unsigned char c : vec) res += (c & 1);
+                }
+            }
+            g_resident_pages = res;
+            g_expert_pages   = tot;
+            if (roll > 0) { w = (w + 1) % (size_t) std::max(1, E); }
+            std::this_thread::sleep_for(interval);
+        }
+    }).detach();
+}
+
+void llama_temporal_start_evictor() {
+    llama_temporal_start_residency_controller();
+    const char * s = getenv("LLAMA_TEMPORAL_EVICT_HZ");
+    const double hz = s ? atof(s) : 0.0;
+    if (hz <= 0.0 || g_expert_regions.empty() || g_evictor_started.exchange(true)) return;
+
+    LLAMA_LOG_INFO("%s: forced expert eviction at %.0f slices/s over %zu regions\n",
+                   __func__, hz, g_expert_regions.size());
+
+    // The thread gets its OWN COPY of the region list. llama-bench loads the model more
+    // than once per invocation, so the global vector keeps growing and reallocating; a
+    // detached thread holding a reference into it is a use-after-free, which is what
+    // segfaulted at high eviction rates (and only rarely at 1 Hz, because the window is
+    // narrow). The snapshot is immutable for the thread's lifetime.
+    const std::vector<expert_region> regions = g_expert_regions;
+
+    std::thread([hz, regions]() {
+        std::mt19937 rng(1234);
+        const auto period = std::chrono::duration<double>(1.0 / hz);
+        for (;;) {
+            const auto & r = regions[rng() % regions.size()];
+            const size_t e = rng() % (size_t) r.n_experts;
+            uint8_t * p = r.addr + e * r.expert_bytes;
+            // align down to a page so madvise accepts it
+            uint8_t * aligned = (uint8_t *) ((uintptr_t) p & ~(uintptr_t) 4095);
+
+            // SAFETY: llama_mmap::unmap_fragment() releases the unused head/tail of the
+            // mapping after load. If such a range is later reused by an ANONYMOUS mapping,
+            // MADV_DONTNEED there does not drop file pages -- it ZERO-FILLS live memory,
+            // which segfaulted at high eviction rates. mincore() fails with ENOMEM on an
+            // unmapped range, so it is a cheap check that the slice is still mapped before
+            // we touch it. Anything that fails the check is dropped permanently.
+            unsigned char probe[1];
+            if (mincore(aligned, 4096, probe) != 0) {
+                continue;
+            }
+            // Two-step eviction (madvise+fadvise) -- madvise alone is the §4 silent no-op:
+            // it zaps PTEs but leaves the page in cache, so the next touch reads 0 B.
+            evict_range(p, r.expert_bytes, r.fd, r.file_off + e * r.expert_bytes);
+            g_evictions++;
+            g_evicted_bytes += (long) r.expert_bytes;
+            std::this_thread::sleep_for(period);
+        }
+    }).detach();
+}
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1168,8 +1429,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                        if ((getenv("LLAMA_TEMPORAL_R") || getenv("LLAMA_NO_REPACK")) && !getenv("LLAMA_TEMPORAL_REPACK")) {
+                            // temporal slot-pool: honor the CPU override LITERALLY. The
+                            // reconsideration below routes q4_K/q8_0 experts back into
+                            // CPU_REPACK (anonymous repacked copies), which the pool
+                            // cannot pread into or evict -- measured: only the 23 q6_K
+                            // down_exps of 135 expert tensors ended up pool-managed.
+                            // LLAMA_NO_REPACK gives the same literal-CPU placement with
+                            // the pool INACTIVE: the like-for-like numerics baseline.
+                            //
+                            // LLAMA_TEMPORAL_REPACK opts back INTO CPU_REPACK: experts
+                            // land in the repacked buffer so mul_mat_id takes the fast
+                            // interleaved GEMM, and the pool streams pre-repacked slices
+                            // from a side-file (LLAMA_TEMPORAL_REPACK_FILE, same byte
+                            // layout as the gguf -- repack is a per-plane permutation).
+                            buft = overrides->buft;
+                        } else {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1550,6 +1828,34 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
+#if defined(_POSIX_MAPPED_FILES)
+            // LLAMA_TEMPORAL_MMAP=2: per-tensor residency policy for MoE on devices whose
+            // RAM is smaller than the model. Expert tensors (*_exps) are the only ones
+            // sparsely used -- top_k of E per token -- so only they are marked evictable.
+            // Attention, norm and embedding weights are touched on every token and are
+            // marked WILLNEED so the kernel keeps them resident instead of thrashing them
+            // alongside the experts (which is what mode 1 does wrong).
+            {
+                static const char * tm = getenv("LLAMA_TEMPORAL_MMAP");
+                static const int temporal_mode = tm ? atoi(tm) : 0;
+                const bool is_expert = strstr(cur->name, "_exps") != nullptr;
+                if (temporal_mode == 2) {
+                    posix_madvise(data, n_size,
+                                  is_expert ? POSIX_MADV_RANDOM : POSIX_MADV_WILLNEED);
+                }
+                // Register expert regions for the forced evictor (see llama_temporal_evict).
+                // An *_exps tensor holds ALL experts for a layer, shape [.., .., n_expert],
+                // so one expert is the slice n_size/n_expert at index e.
+                if (is_expert && cur->ne[2] > 1) {
+                    llama_temporal_register_experts((uint8_t *) data, n_size, (int) cur->ne[2],
+                                                   weight->offs, files.at(weight->idx)->file_id());
+                } else {
+                    // everything that is not an expert is hot: needed every token
+                    llama_temporal_register_hot((uint8_t *) data, n_size);
+                }
+            }
+#endif
+
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
@@ -1573,9 +1879,83 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // temporal repack-stream: CPU_REPACK expert tensors are not flagged
+            // is_host, so they would fall to the GPU-upload path below. Route them
+            // through the pool path too -- their data is ordinary host memory the pool
+            // preads/madvises, and mul_mat_id takes the fast repacked GEMM because the
+            // buffer type is CPU_REPACK.
+            const bool tm_repack_exps =
+                (strstr(cur->name, "_exps") != nullptr && cur->ne[2] > 1) &&
+                ggml_backend_buffer_get_type(cur->buffer) != nullptr &&
+                strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)), "CPU_REPACK") == 0;
+            if (ggml_backend_buffer_is_host(cur->buffer) || tm_repack_exps) {
+#if defined(__linux__)
+                // temporal slot-pool: with --mmap 0 and experts overridden to a plain
+                // CPU buffer (-ot "_exps=CPU"), expert tensors land here in anonymous
+                // memory. Register them for explicit pread/madvise residency control.
+                // fd is dup'd because this llama_file closes when the loader is
+                // destroyed but the pool lives for the process (the §4/S2-3 lesson).
+                //
+                // LAZY LOAD: when the pool will manage this tensor with R < n_expert,
+                // do NOT read the expert data here -- experts start ABSENT and are
+                // fetched on first use. Reading 5.3 GiB of soon-evicted experts is a
+                // pointless load-time transient, and on a 7.7 GB-RAM device it drove
+                // the system into an unkillable-OOM KERNEL PANIC (Pixel 10a, pstore:
+                // "System is deadlocked on memory").
+                const bool is_exps = strstr(cur->name, "_exps") != nullptr && cur->ne[2] > 1;
+                bool lazy = false;
+                if (is_exps) {
+                    const char * r = getenv("LLAMA_TEMPORAL_R");
+                    lazy = r && atoi(r) < (int) cur->ne[2];
+                }
+                if (!lazy) {
+                    if (tm_repack_exps) {
+                        // CPU_REPACK tensors must go through the buffer's set_tensor, which
+                        // applies the interleaving repack. Reading raw gguf bytes straight
+                        // into cur->data would leave PLAIN Q4_0 in a buffer whose kernel
+                        // expects the repacked layout -- fast but numerically garbage.
+                        std::vector<uint8_t> tmp(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(tmp.data(), n_size);
+                        ggml_backend_tensor_set(cur, tmp.data(), 0, n_size);
+                    } else {
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(cur->data, n_size);
+                    }
+                }
+                if (is_exps) {
+                    // Fetch source: the gguf by default, or a pre-repacked side-file
+                    // (same per-expert byte layout) when streaming repacked experts.
+                    // The pool derives its fetch path via readlink on the first fd, so
+                    // registering the side-file's fd points all fetches at it.
+                    int reg_fd;
+                    const char * side = getenv("LLAMA_TEMPORAL_REPACK_FILE");
+                    if (side && side[0]) {
+                        // same rule the dump tool used: the fused [gate|up|down] region
+                        // starts at round_up_4096(gguf_size + 4096). No index file needed.
+                        ggml_temporal_pool_set_fused_base(((size_t) file->size() + 4096 + 4095) & ~(size_t) 4095);
+                    }
+                    if (side && side[0]) {
+                        static int side_fd = open(side, O_RDONLY);
+                        if (side_fd < 0) {
+                            throw std::runtime_error(format("failed to open LLAMA_TEMPORAL_REPACK_FILE '%s': %s", side, strerror(errno)));
+                        }
+                        reg_fd = dup(side_fd);
+                    } else {
+                        reg_fd = dup(file->file_id());
+                    }
+                    // Side-file slices are 4K-aligned (same rule the dump tool applies) so
+                    // the pool can O_DIRECT DMA straight into the slot with no bounce memcpy.
+                    const size_t fetch_off = (side && side[0])
+                        ? ((weight->offs + 4095) & ~(size_t) 4095)
+                        : weight->offs;
+                    ggml_temporal_pool_register(cur->data, n_size, (int) cur->ne[2],
+                                                reg_fd, fetch_off, cur->name);
+                }
+#else
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+#endif
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1686,6 +2066,19 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+#if defined(_POSIX_MAPPED_FILES)
+        // Start the residency controller HERE, on the load-complete path only.
+        // Two bugs lived in the placement of this call:
+        //  - the tail call below is skipped entirely when a progress_callback is set
+        //    (early return above), so with a single buffer type the controller never
+        //    started at all;
+        //  - load_all_data runs once per ggml context, and an unguarded tail call let a
+        //    NON-final call start the controller with a partial region list (observed:
+        //    23 of 135 expert tensors -- only the q6_K down_exps -- under control).
+        // Starting only when size_done >= size_data guarantees the snapshot sees every
+        // registered region.
+        llama_temporal_start_evictor();
+#endif
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.

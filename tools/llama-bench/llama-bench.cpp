@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#include <unistd.h>   // ftruncate for the repacked side-file generator
 
 #include "arg.h"
 #include "build-info.h"
@@ -25,6 +26,9 @@
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
+#include "ggml-cpu.h"   // ggml_temporal_repack_q4_0 (side-file generator)
+#include "gguf.h"
+#include <map>
 #include "llama.h"
 
 #ifdef _WIN32
@@ -1192,6 +1196,15 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
 
+        // LLAMA_NO_REPACK=1: compute from the mmap'd file-backed pages instead of
+        // copying weights into anonymous repacked buffers (q4_K_8x8 etc.). Required for
+        // any page-cache residency experiment: with repack on, decode reads the 5.4 GiB
+        // anonymous copy and evicting file pages measures nothing. Env var rather than a
+        // flag so every arm runs the same binary with only the environment differing.
+        if (getenv("LLAMA_NO_REPACK")) {
+            mparams.use_extra_bufts = false;
+        }
+
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
                 mparams.tensor_buft_overrides = nullptr;
@@ -2167,6 +2180,142 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
 // satisfies -Wmissing-declarations
 int llama_bench(int argc, char ** argv);
 
+// temporal slot-pool: build a repacked expert side-file. Walk the gguf, and for each
+// _exps Q4_0 tensor repack its bytes into the CPU-optimal interleaved layout at the
+// SAME file offset (repack is a per-plane permutation, so per-expert slice offsets and
+// sizes are unchanged). The temporal pool streams from this file so experts take
+// mul_mat_id's fast repacked GEMM path. Bounded memory: one tensor in flight.
+static int tm_repack_dump(const char * model_path, const char * out_path) {
+    struct ggml_context * meta = nullptr;
+    struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    struct gguf_context * ctx = gguf_init_from_file(model_path, gp);
+    if (!ctx || !meta) {
+        fprintf(stderr, "repack-dump: gguf_init_from_file('%s') failed\n", model_path);
+        return 1;
+    }
+    const size_t data_off = gguf_get_data_offset(ctx);
+    FILE * in  = fopen(model_path, "rb");
+    FILE * out = fopen(out_path, "w+b");   // w+ : the fused pass reads the mirror region back
+    if (!in || !out) { fprintf(stderr, "repack-dump: open failed\n"); return 1; }
+    // size the side-file to the gguf so every tensor offset is valid (holes stay sparse)
+    fseeko(in, 0, SEEK_END);
+    // +4096 of slack: the last expert slice is rounded UP to a 4K boundary and would
+    // otherwise run past the end of a file sized exactly like the gguf.
+    const off_t gguf_sz = ftello(in);
+    off_t fsize = gguf_sz + 4096;
+    if (ftruncate(fileno(out), fsize) != 0) { fprintf(stderr, "repack-dump: ftruncate failed\n"); return 1; }
+
+    int64_t n = gguf_get_n_tensors(ctx);
+    int64_t n_done = 0;
+    // Expert slices are placed at 4K-ALIGNED offsets so the pool can O_DIRECT DMA straight
+    // into the (already 4K-aligned) slot with no bounce buffer and no memcpy. gguf packs
+    // tensors at 32-byte alignment, which forced a 216 KiB copy per fetch. The rule is
+    // side_off = round_up_4096(gguf_off) -- computed identically by the loader, so no index
+    // file is needed. Verified non-overlapping below; aborts if the assumption ever breaks.
+    size_t prev_end = 0;
+    const char * prev_name = "";
+    struct slice_info { size_t off; int n_exp; size_t ebytes; };
+    std::map<std::pair<int,int>, slice_info> slices;   // (layer, slot) -> where it landed
+    for (int64_t i = 0; i < n; i++) {
+        const char * name = gguf_get_tensor_name(ctx, i);
+        if (!strstr(name, "_exps")) { continue; }
+        struct ggml_tensor * t = ggml_get_tensor(meta, name);
+        if (!t) { fprintf(stderr, "repack-dump: no meta for %s\n", name); return 1; }
+        if (t->type != GGML_TYPE_Q4_0) {
+            fprintf(stderr, "repack-dump: %s is %s, not Q4_0 -- refusing (mixed quant not supported)\n",
+                    name, ggml_type_name(t->type));
+            return 1;
+        }
+        const size_t  gguf_off = data_off + gguf_get_tensor_offset(ctx, i);
+        const size_t  off      = (gguf_off + 4095) & ~(size_t) 4095;   // 4K-aligned slice base
+        const size_t  nb       = ggml_nbytes(t);
+        if (off < prev_end) {
+            fprintf(stderr, "repack-dump: 4K alignment would overlap %s into %s "
+                            "(off=%zu prev_end=%zu) -- refusing\n", prev_name, name, off, prev_end);
+            return 1;
+        }
+        prev_end = off + nb;
+        prev_name = name;
+        const int64_t ne0   = t->ne[0];
+        const int64_t nrows = t->ne[1] * t->ne[2] * t->ne[3];
+        std::vector<char> plain(nb), rep(nb);
+        if (fseeko(in, gguf_off, SEEK_SET) != 0 || fread(plain.data(), 1, nb, in) != nb) {
+            fprintf(stderr, "repack-dump: read %s failed\n", name); return 1;
+        }
+        int rc = ggml_temporal_repack_q4_0(rep.data(), plain.data(), ne0, nrows);
+        if (rc != 0) {
+            fprintf(stderr, "repack-dump: repack %s failed rc=%d (ne0=%lld nrows=%lld)\n",
+                    name, rc, (long long) ne0, (long long) nrows);
+            return 1;
+        }
+        if (fseeko(out, off, SEEK_SET) != 0 || fwrite(rep.data(), 1, nb, out) != nb) {
+            fprintf(stderr, "repack-dump: write %s failed\n", name); return 1;
+        }
+        {   // remember where this slice went, for the fused region below
+            int Lidx = -1, slot = -1;
+            sscanf(name, "blk.%d.", &Lidx);
+            if      (strstr(name, "ffn_gate_exps")) { slot = 0; }
+            else if (strstr(name, "ffn_up_exps"))   { slot = 1; }
+            else if (strstr(name, "ffn_down_exps")) { slot = 2; }
+            if (Lidx >= 0 && slot >= 0) {
+                slices[{Lidx, slot}] = slice_info{ off, (int) t->ne[2], nb / (size_t) t->ne[2] };
+            }
+        }
+        n_done++;
+        fprintf(stderr, "repack-dump: %-40s off=%zu nb=%zu ne0=%lld nrows=%lld OK\n",
+                name, off, nb, (long long) ne0, (long long) nrows);
+    }
+    // ---- fused region: [gate|up|down] contiguous per (layer, expert) ----------------
+    // One 648 KiB request per swap instead of six 108 KiB ones. Placed after the mirror
+    // region at a 4K-aligned base the loader recomputes as round_up_4096(gguf_size + 4096),
+    // so no index file is needed. Layout: base + (layer*n_experts + e) * 3 * expert_bytes.
+    {
+        fflush(out);   // mirror writes must be on disk before we read them back
+        const size_t fused_base = (size_t)(gguf_sz + 4096 + 4095) & ~(size_t) 4095;
+        int n_layers = 0, n_exp = 0; size_t ebytes = 0;
+        for (auto & kv : slices) {
+            if (kv.first.first + 1 > n_layers) { n_layers = kv.first.first + 1; }
+        }
+        for (auto & kv : slices) { n_exp = kv.second.n_exp; ebytes = kv.second.ebytes; break; }
+        if (n_layers == 0 || n_exp == 0) { fprintf(stderr, "repack-dump: no expert layers found\n"); return 1; }
+        const size_t fused_bytes = (size_t) n_layers * n_exp * 3 * ebytes;
+        if (ftruncate(fileno(out), (off_t)(fused_base + fused_bytes)) != 0) {
+            fprintf(stderr, "repack-dump: ftruncate(fused) failed\n"); return 1;
+        }
+        std::vector<char> tmp(ebytes);
+        for (int L = 0; L < n_layers; L++) {
+            for (int sl = 0; sl < 3; sl++) {
+                auto it = slices.find({L, sl});
+                if (it == slices.end()) {
+                    fprintf(stderr, "repack-dump: layer %d missing slot %d\n", L, sl); return 1;
+                }
+                if (it->second.n_exp != n_exp || it->second.ebytes != ebytes) {
+                    fprintf(stderr, "repack-dump: ragged expert geometry at L%d slot %d\n", L, sl); return 1;
+                }
+                for (int e = 0; e < n_exp; e++) {
+                    // read back the already-repacked slice from the mirror region
+                    if (fseeko(out, (off_t)(it->second.off + (size_t) e * ebytes), SEEK_SET) != 0 ||
+                        fread(tmp.data(), 1, ebytes, out) != ebytes) {
+                        fprintf(stderr, "repack-dump: fused read-back failed L%d s%d e%d\n", L, sl, e); return 1;
+                    }
+                    const size_t dst = fused_base
+                        + ((size_t) L * n_exp + (size_t) e) * 3 * ebytes + (size_t) sl * ebytes;
+                    if (fseeko(out, (off_t) dst, SEEK_SET) != 0 ||
+                        fwrite(tmp.data(), 1, ebytes, out) != ebytes) {
+                        fprintf(stderr, "repack-dump: fused write failed L%d s%d e%d\n", L, sl, e); return 1;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "repack-dump: fused region base=%zu layers=%d experts=%d expert_bytes=%zu (%.2f GiB)\n",
+                fused_base, n_layers, n_exp, ebytes, fused_bytes / 1073741824.0);
+    }
+    fflush(out); fclose(out); fclose(in);
+    gguf_free(ctx); ggml_free(meta);
+    fprintf(stderr, "repack-dump: wrote %lld expert tensors to %s\n", (long long) n_done, out_path);
+    return 0;
+}
+
 int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
@@ -2186,6 +2335,16 @@ int llama_bench(int argc, char ** argv) {
 
     // initialize backends
     ggml_backend_load_all();
+
+    // temporal slot-pool: one-shot repacked side-file generation, then exit.
+    if (const char * dump = getenv("LLAMA_TEMPORAL_REPACK_DUMP")) {
+        const char * model = nullptr;
+        for (int i = 1; i + 1 < argc; i++) {
+            if (!strcmp(argv[i], "-m") || !strcmp(argv[i], "--model")) { model = argv[i + 1]; }
+        }
+        if (!model) { fprintf(stderr, "repack-dump: need -m <model>\n"); return 1; }
+        return tm_repack_dump(model, dump);
+    }
 
     cmd_params params = parse_cmd_params(argc, argv);
 

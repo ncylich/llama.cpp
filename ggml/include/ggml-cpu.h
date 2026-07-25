@@ -146,6 +146,40 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    // temporal expert slot-pool: register an expert tensor (anonymous, non-repacked)
+    // for explicit residency control. fd must be dup'd by the caller; the pool owns it.
+    // Inactive unless LLAMA_TEMPORAL_R is set. Linux-only; no-op stub elsewhere.
+    // name groups gate/up/down of one layer for same-token sibling prefetch.
+    // base offset of the fused [gate|up|down] region inside the repacked side-file
+    GGML_BACKEND_API void ggml_temporal_pool_set_fused_base(size_t base);
+
+    GGML_BACKEND_API void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int fd, size_t file_off, const char * name);
+
+    // two-pass enforce: ggml custom-op callback filling selected_experts [K, n_tokens]
+    // with the layer's resident window (new expert pinned to slot K-1); userdata = layer.
+    GGML_BACKEND_API void ggml_temporal_window_fill(struct ggml_tensor * dst, int ith, int nth, void * userdata);
+
+    // two-pass wait barrier: a ggml custom-op that blocks until the newly-swapped expert
+    // (window slot K-1) finishes streaming, before the new-expert sub-pass computes it.
+    // Passes ids through unchanged; kernel-agnostic (needed for the repacked GEMM path).
+    GGML_BACKEND_API void ggml_temporal_wait_new(struct ggml_tensor * dst, int ith, int nth, void * userdata);
+
+    // temporal slot-pool: repack raw Q4_0 bytes into this CPU's optimal interleaved
+    // layout (byte-identical to CPU_REPACK's load-time repack). Used to build a
+    // repacked expert side-file the pool streams from, so streamed experts take the
+    // fast repacked GEMM path. dst/src are the same size. nrows = ne1*ne2*ne3.
+    GGML_BACKEND_API int ggml_temporal_repack_q4_0(void * dst, const void * src, int64_t ne0, int64_t nrows);
+
+    // trace hooks so the REPACKED mul_mat_id (repack.cpp, a separate kernel) can emit the
+    // same per-expert GEMV events as the custom one -- without these the temporal timeline
+    // has no compute spans once experts are routed to CPU_REPACK.
+    // make the repacked mul_mat_id wait for a streamed expert before computing it
+    GGML_BACKEND_API void ggml_tm_wait_src_expert(const struct ggml_tensor * src0, int e, int ith);
+
+    GGML_BACKEND_API int    ggml_tm_trace_on(void);
+    GGML_BACKEND_API double ggml_tm_trace_now(void);
+    GGML_BACKEND_API void   ggml_tm_trace_gemv(double ts, double dur, int ith, int layer, int expert);
+
 #ifdef __cplusplus
 }
 #endif

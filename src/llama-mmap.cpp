@@ -447,10 +447,28 @@ struct llama_mmap::impl {
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+
+        // LLAMA_TEMPORAL_MMAP: demand-paged residency for MoE on memory-constrained
+        // devices. The default path populates the ENTIRE file (MAP_POPULATE +
+        // MADV_WILLNEED + FADV_SEQUENTIAL). On a phone whose usable RAM is smaller than
+        // the model that forces thrashing: the kernel evicts expert pages it just read
+        // in order to read the next ones, even though only top_k of E experts are
+        // touched per token. Setting this leaves the kernel to fault in only what is
+        // actually referenced -- the temporal-residency behaviour we want to measure.
+        //   1 = demand-page the whole file (MADV_RANDOM everywhere)
+        //   2 = per-tensor policy, applied by llama-model-loader: experts get
+        //       MADV_RANDOM, everything else MADV_WILLNEED. Mode 1 evicts attention and
+        //       embedding weights too, which are needed on EVERY token, so mode 2 exists
+        //       to keep the always-hot tensors resident and stream only the experts --
+        //       the same split the CUDA kernel makes.
+        const char * temporal_env = getenv("LLAMA_TEMPORAL_MMAP");
+        const int temporal_mode = temporal_env ? atoi(temporal_env) : 0;
+        const bool temporal = temporal_mode >= 1;
+        if (temporal) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        if (posix_fadvise(fd, 0, 0, temporal ? POSIX_FADV_RANDOM : POSIX_FADV_SEQUENTIAL)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., %s) failed: %s\n",
+                    temporal ? "POSIX_FADV_RANDOM" : "POSIX_FADV_SEQUENTIAL", strerror(errno));
         }
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
@@ -465,12 +483,18 @@ struct llama_mmap::impl {
                         strerror(errno));
             }
         }
-        if (numa) {
+        if (numa || temporal_mode == 1) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
             }
         }
+        // Emitted unconditionally so a result row can prove which mmap policy the
+        // binary actually used, rather than which one we believe we passed (M27).
+        LLAMA_LOG_INFO("%s: mmap policy = %s (populate=%s, advise=%s)\n", __func__,
+                temporal ? "TEMPORAL" : "default",
+                prefetch ? "yes" : "no",
+                (numa || temporal) ? "RANDOM" : "WILLNEED/SEQUENTIAL");
 
         mapped_fragments.emplace_back(0, file->size());
     }
