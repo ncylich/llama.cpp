@@ -1486,6 +1486,7 @@ UseGgmlGemm2:;
 //   LLAMA_TEMPORAL_SIBLING_PREFETCH=0 disable form-2 overlap (default on)
 //   LLAMA_TEMPORAL_ODIRECT=1      O_DIRECT fetches (bypass page cache by construction)
 //   unset LLAMA_TEMPORAL_R        pool inactive (registration is harmless).
+#if defined(__linux__) || defined(_WIN32)
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -1494,6 +1495,8 @@ UseGgmlGemm2:;
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <linux/io_uring.h>
+#endif
+#include "temporal-port.h"
 
 #ifndef RWF_HIPRI
 #define RWF_HIPRI 0x00000001   // polled completion: skip the interrupt+wakeup path
@@ -1540,20 +1543,20 @@ struct ggml_tm_pool_tensor {
 
 static struct ggml_tm_pool_tensor g_tm_pool[512];
 static int             g_tm_pool_n = 0;
-static pthread_mutex_t g_tm_mtx     = PTHREAD_MUTEX_INITIALIZER;  // pool state + queue
-static pthread_cond_t  g_tm_work_cv = PTHREAD_COND_INITIALIZER;   // workers: queue non-empty
-static pthread_cond_t  g_tm_done_cv = PTHREAD_COND_INITIALIZER;   // ensure: a fetch landed
-static _Atomic uint64_t g_tm_fetches;
-static _Atomic uint64_t g_tm_fetched_bytes;
-static _Atomic uint64_t g_tm_evictions;
+static tm_mutex_t      g_tm_mtx     = TM_MUTEX_INIT;  // pool state + queue
+static tm_cond_t       g_tm_work_cv = TM_COND_INIT;   // workers: queue non-empty
+static tm_cond_t       g_tm_done_cv = TM_COND_INIT;   // ensure: a fetch landed
+static tm_au64_t g_tm_fetches;
+static tm_au64_t g_tm_fetched_bytes;
+static tm_au64_t g_tm_evictions;
 static int      g_tm_R = -1;          // -1 = pool inactive
 static double   g_tm_swap_prob = 0.0;
 static uint64_t g_tm_rng = 0x9E3779B97F4A7C15ull;
 
-static _Atomic uint64_t g_tm_hook_calls;
-static _Atomic uint64_t g_tm_hook_miss;   // op ran on a tensor the pool doesn't know
-static _Atomic uint64_t g_tm_fetch_ns;    // summed IO time across workers (per-read)
-static _Atomic uint64_t g_tm_wait_ns;     // time the compute thread actually BLOCKED in
+static tm_au64_t g_tm_hook_calls;
+static tm_au64_t g_tm_hook_miss;   // op ran on a tensor the pool doesn't know
+static tm_au64_t g_tm_fetch_ns;    // summed IO time across workers (per-read)
+static tm_au64_t g_tm_wait_ns;     // time the compute thread actually BLOCKED in
                                           // ensure -- the true per-op stall; with full
                                           // overlap this goes to ~0 while fetch_ns stays
 static bool      g_tm_odirect  = false;
@@ -1570,10 +1573,10 @@ static char      g_tm_path[1024] = {0};   // the gguf path; workers open their o
 // prioritization delays the sibling ops it was meant to protect.
 static struct { int ti; int e; int part; int cls; uint64_t enq_ns; } g_tm_q[GGML_TM_QCAP];
 static int g_tm_q_head = 0, g_tm_q_n = 0;   // ring window [head, head+n) under mutex
-static _Atomic int g_tm_q_len = 0;          // == n; atomic for unlocked spin-peek
-static _Atomic uint64_t g_tm_qwait_hi_ns;   // enqueue->pop for HI items (the stall path)
-static _Atomic uint64_t g_tm_qhi_n;
-static _Atomic int g_tm_spinners = 0;   // at most 2 workers busy-poll the queue: 6 of 8
+static tm_ai32_t g_tm_q_len = 0;          // == n; atomic for unlocked spin-peek
+static tm_au64_t g_tm_qwait_hi_ns;   // enqueue->pop for HI items (the stall path)
+static tm_au64_t g_tm_qhi_n;
+static tm_ai32_t g_tm_spinners = 0;   // at most 2 workers busy-poll the queue: 6 of 8
                                         // cores run GEMVs; more spinners would fight
                                         // compute instead of cutting wakeup latency
 // enforced 1-swap policy globals (defined here so ggml_tm_pool_report can read them)
@@ -1585,7 +1588,7 @@ static int      g_tm_ewin[GGML_TM_MAXLAYER][GGML_TM_MAXK];
 static int      g_tm_ewin_k[GGML_TM_MAXLAYER];
 static uint8_t  g_tm_ein[GGML_TM_MAXLAYER][8192];
 static uint64_t g_tm_ernd[GGML_TM_MAXLAYER];
-static _Atomic uint64_t g_tm_swaps;
+static tm_au64_t g_tm_swaps;
 
 // --- execution trace: 2D timeline (lane x time) of the expert path -----------
 // LLAMA_TEMPORAL_TRACE=1 records timestamped spans. Lanes: compute thread ith (0..7),
@@ -1594,17 +1597,17 @@ static _Atomic uint64_t g_tm_swaps;
 struct tm_ev { double ts, dur; int lane, type, layer, expert; };
 #define TM_TRACE_MAX 800000
 static struct tm_ev    g_tm_trace[TM_TRACE_MAX];
-static _Atomic int     g_tm_trace_n;
+static tm_ai32_t g_tm_trace_n;
 static bool            g_tm_trace_on = false;
 static struct timespec g_tm_trace_t0;
 static inline double tm_us(const struct timespec * t) {
     return (double)(t->tv_sec - g_tm_trace_t0.tv_sec) * 1e6
          + (double)(t->tv_nsec - g_tm_trace_t0.tv_nsec) / 1e3;   // microseconds
 }
-static inline double tm_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return tm_us(&t); }
+static inline double tm_now(void) { struct timespec t; tm_clock(&t); return tm_us(&t); }
 static inline void tm_ev(double ts, double dur, int lane, int type, int layer, int expert) {
     if (!g_tm_trace_on) return;
-    int i = atomic_fetch_add(&g_tm_trace_n, 1);
+    int i = tm_add32(&g_tm_trace_n, 1);
     if (i < TM_TRACE_MAX) g_tm_trace[i] = (struct tm_ev){ ts, dur, lane, type, layer, expert };
 }
 static void tm_trace_dump(void) {
@@ -1612,7 +1615,7 @@ static void tm_trace_dump(void) {
     const char * f = getenv("LLAMA_TEMPORAL_TRACE_FILE");
     if (!f) f = "/data/local/tmp/tmoe/trace.json";
     FILE * fp = fopen(f, "w"); if (!fp) return;
-    int n = atomic_load(&g_tm_trace_n); if (n > TM_TRACE_MAX) n = TM_TRACE_MAX;
+    int n = tm_load32(&g_tm_trace_n); if (n > TM_TRACE_MAX) n = TM_TRACE_MAX;
     static const char * tn[] = { "GEMV", "WAIT", "FETCH", "EVICT", "ENSURE", "ROUTER" };
     fprintf(fp, "[\n");
     for (int i = 0; i < n; i++) {
@@ -1628,13 +1631,13 @@ static void tm_trace_dump(void) {
 // how many syscalls does one expert fetch take, how long is each, and how much wall time
 // sits OUTSIDE the syscalls (setup / iovec rebuild / accounting). Built because three
 // standalone look-alike harnesses each disagreed with the engine for a different reason.
-static _Atomic uint64_t g_tm_pf_calls;      // preadv/pread syscalls issued
-static _Atomic uint64_t g_tm_pf_fetches;    // expert fetches profiled
-static _Atomic uint64_t g_tm_pf_sys_ns;     // time inside syscalls
-static _Atomic uint64_t g_tm_pf_wall_ns;    // total fetch wall time
-static _Atomic uint64_t g_tm_pf_first_ns;   // time inside the FIRST syscall of a fetch
-static _Atomic uint64_t g_tm_pf_max_ns;     // slowest single syscall seen
-static _Atomic uint64_t g_tm_pf_short;      // syscalls that returned less than asked
+static tm_au64_t g_tm_pf_calls;      // preadv/pread syscalls issued
+static tm_au64_t g_tm_pf_fetches;    // expert fetches profiled
+static tm_au64_t g_tm_pf_sys_ns;     // time inside syscalls
+static tm_au64_t g_tm_pf_wall_ns;    // total fetch wall time
+static tm_au64_t g_tm_pf_first_ns;   // time inside the FIRST syscall of a fetch
+static tm_au64_t g_tm_pf_max_ns;     // slowest single syscall seen
+static tm_au64_t g_tm_pf_short;      // syscalls that returned less than asked
 static bool   g_tm_fetchprof = false;
 static bool   g_tm_fused = false;    // LLAMA_TEMPORAL_FUSED: one preadv per expert swap
 static size_t g_tm_fused_base = 0;  // byte offset of the fused region in the side-file
@@ -1654,7 +1657,7 @@ static int ggml_tm_find(int layer, int slot) {
 }
 static int g_tm_max_spinners = 2;   // LLAMA_TEMPORAL_SPINNERS: workers allowed to spin-poll
 static int g_tm_inflight = 0;       // fetch parts dequeued but not yet completed
-static pthread_cond_t g_tm_quiet_cv = PTHREAD_COND_INITIALIZER;  // signalled when they drain
+static tm_cond_t       g_tm_quiet_cv = TM_COND_INIT;  // signalled when they drain
 static int g_tm_evict_defer = -1;   // LLAMA_TEMPORAL_EVICT_DEFER: hold evictions until quiet
 static int g_tm_split = 1;   // sub-reads per expert fetch (LLAMA_TEMPORAL_SPLIT, 1..4).
                              // Default 1: split=2 measured WORSE in all interleaved
@@ -1671,41 +1674,41 @@ static bool g_tm_workers_started = false;
 // the fetch itself, closing the evict->refetch loop.
 static struct { int ti; int e; } g_tm_jq[GGML_TM_QCAP];
 static int g_tm_jq_head = 0, g_tm_jq_len = 0;
-static pthread_cond_t g_tm_jan_cv = PTHREAD_COND_INITIALIZER;
+static tm_cond_t       g_tm_jan_cv = TM_COND_INIT;
 
 static void ggml_tm_pool_report(void) {
-    uint64_t f = atomic_load(&g_tm_fetches);
+    uint64_t f = tm_load64(&g_tm_fetches);
     if (g_tm_fetchprof) {
-        uint64_t nf = atomic_load(&g_tm_pf_fetches);
+        uint64_t nf = tm_load64(&g_tm_pf_fetches);
         if (nf) {
             fprintf(stderr, "temporal-fetchprof: fetches=%llu syscalls/fetch=%.2f "
                     "wall/fetch=%.0fus sys/fetch=%.0fus first_call=%.0fus outside_sys=%.0fus "
                     "max_call=%.0fus short_reads=%llu\n",
                     (unsigned long long) nf,
-                    (double) atomic_load(&g_tm_pf_calls) / (double) nf,
-                    atomic_load(&g_tm_pf_wall_ns) / 1e3 / nf,
-                    atomic_load(&g_tm_pf_sys_ns) / 1e3 / nf,
-                    atomic_load(&g_tm_pf_first_ns) / 1e3 / nf,
-                    (atomic_load(&g_tm_pf_wall_ns) - atomic_load(&g_tm_pf_sys_ns)) / 1e3 / nf,
-                    atomic_load(&g_tm_pf_max_ns) / 1e3,
-                    (unsigned long long) atomic_load(&g_tm_pf_short));
+                    (double) tm_load64(&g_tm_pf_calls) / (double) nf,
+                    tm_load64(&g_tm_pf_wall_ns) / 1e3 / nf,
+                    tm_load64(&g_tm_pf_sys_ns) / 1e3 / nf,
+                    tm_load64(&g_tm_pf_first_ns) / 1e3 / nf,
+                    (tm_load64(&g_tm_pf_wall_ns) - tm_load64(&g_tm_pf_sys_ns)) / 1e3 / nf,
+                    tm_load64(&g_tm_pf_max_ns) / 1e3,
+                    (unsigned long long) tm_load64(&g_tm_pf_short));
         }
     }
     fprintf(stderr, "temporal-pool: fetches=%llu fetched_mib=%.1f evictions=%llu "
             "tensors=%d hook_calls=%llu hook_miss=%llu avg_fetch_us=%.1f qwait_hi_us=%.1f wait_ms=%.1f odirect=%d workers=%d sibling=%d split=%d\n",
             (unsigned long long) f,
-            (double) atomic_load(&g_tm_fetched_bytes) / (1024.0 * 1024.0),
-            (unsigned long long) atomic_load(&g_tm_evictions),
+            (double) tm_load64(&g_tm_fetched_bytes) / (1024.0 * 1024.0),
+            (unsigned long long) tm_load64(&g_tm_evictions),
             g_tm_pool_n,
-            (unsigned long long) atomic_load(&g_tm_hook_calls),
-            (unsigned long long) atomic_load(&g_tm_hook_miss),
-            f ? (double) atomic_load(&g_tm_fetch_ns) / 1e3 / (double) f : 0.0,
-            atomic_load(&g_tm_qhi_n) ? (double) atomic_load(&g_tm_qwait_hi_ns) / 1e3 / (double) atomic_load(&g_tm_qhi_n) : 0.0,
-            (double) atomic_load(&g_tm_wait_ns) / 1e6,
+            (unsigned long long) tm_load64(&g_tm_hook_calls),
+            (unsigned long long) tm_load64(&g_tm_hook_miss),
+            f ? (double) tm_load64(&g_tm_fetch_ns) / 1e3 / (double) f : 0.0,
+            tm_load64(&g_tm_qhi_n) ? (double) tm_load64(&g_tm_qwait_hi_ns) / 1e3 / (double) tm_load64(&g_tm_qhi_n) : 0.0,
+            (double) tm_load64(&g_tm_wait_ns) / 1e6,
             g_tm_odirect ? 1 : 0, g_tm_nworkers, g_tm_sibling ? 1 : 0, g_tm_split);
     if (g_tm_enforce) {
         fprintf(stderr, "temporal-pool: ENFORCE on, swaps=%llu\n",
-                (unsigned long long) atomic_load(&g_tm_swaps));
+                (unsigned long long) tm_load64(&g_tm_swaps));
     }
 }
 
@@ -1720,50 +1723,56 @@ static void ggml_tm_set_io_affinity(void) {
     if (!s || !*s) return;
     int lo = -1, hi = -1;
     if (sscanf(s, "%d-%d", &lo, &hi) != 2 || lo < 0 || hi < lo || hi >= 64) return;
+#if defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int c = lo; c <= hi; c++) { CPU_SET(c, &set); }
     sched_setaffinity(0, sizeof(set), &set);   // 0 = calling thread on Linux
+#else
+    tm_set_affinity_range(lo, hi);             // SetThreadAffinityMask on the calling thread
+#endif
 }
 
 static void ggml_tm_evict(struct ggml_tm_pool_tensor * t, int e);  // fwd: evict-on-arrival
 
-static void * ggml_tm_worker(void * arg) {
+TM_THREAD_FN(ggml_tm_worker) {
     const int wid = (int)(intptr_t) arg;
     ggml_tm_set_io_affinity();
-    int fd = open(g_tm_path, O_RDONLY | (g_tm_odirect ? O_DIRECT : 0));
-    if (fd < 0) {
-        fprintf(stderr, "temporal-pool: FATAL worker open(%s) failed: %s\n", g_tm_path, strerror(errno));
+    tm_file_t fd = tm_open_read(g_tm_path, g_tm_odirect);
+    if (!tm_file_ok(fd)) {
+        fprintf(stderr, "temporal-pool: FATAL worker open(%s) failed: %s\n", g_tm_path, tm_errstr());
         abort();
     }
+#if defined(__linux__)
     // IO priority: never queue our fetches behind background system IO. Try RT class
     // first (needs privilege, usually refused on Android), fall back to best-effort 0.
     // ioprio_set(IOPRIO_WHO_PROCESS=1, 0=calling thread, (class<<13)|level)
     if (syscall(__NR_ioprio_set, 1, 0, (1 << 13) | 0) != 0) {
         syscall(__NR_ioprio_set, 1, 0, (2 << 13) | 0);
     }
+#endif
     uint8_t * bounce = NULL;
     size_t bounce_sz = 0;
     for (;;) {
         // bounded spin-peek before sleeping: during decode a fetch burst arrives every
         // few hundred us, and the futex sleep/wake round-trip would sit at the FRONT of
         // every fetch's latency. At most 2 workers spin (the cores compute doesn't use).
-        if (atomic_load_explicit(&g_tm_q_len, memory_order_relaxed) == 0) {
+        if (tm_load32_relaxed(&g_tm_q_len) == 0) {
             // How many workers may spin-poll. Everyone above the cap sleeps on the condvar
             // and pays a futex wake + scheduler dispatch, which lands at the FRONT of that
             // part's latency -- and a layer waits on max(start+duration), so a late start
             // is pure critical path. This cap was hard-coded to 2, which is exactly why
             // 2 parts start immediately and the rest ~150 us later. LLAMA_TEMPORAL_SPINNERS.
-            if (atomic_fetch_add(&g_tm_spinners, 1) < g_tm_max_spinners) {
+            if (tm_add32(&g_tm_spinners, 1) < g_tm_max_spinners) {
                 for (int i = 0; i < 60000; i++) {   // ~200-400 us of polling
-                    if (atomic_load_explicit(&g_tm_q_len, memory_order_relaxed) > 0) break;
+                    if (tm_load32_relaxed(&g_tm_q_len) > 0) break;
                 }
             }
-            atomic_fetch_sub(&g_tm_spinners, 1);
+            tm_sub32(&g_tm_spinners, 1);
         }
-        pthread_mutex_lock(&g_tm_mtx);
+        tm_mutex_lock(&g_tm_mtx);
         while (g_tm_q_len == 0) {
-            pthread_cond_wait(&g_tm_work_cv, &g_tm_mtx);
+            tm_cond_wait(&g_tm_work_cv, &g_tm_mtx);
         }
         // oldest HI item, else oldest LO (O(n) scan; n is small in decode)
         int pick = -1;
@@ -1777,10 +1786,10 @@ static void * ggml_tm_worker(void * arg) {
         int e    = g_tm_q[idx].e;
         int part = g_tm_q[idx].part;
         if (g_tm_q[idx].cls == 0) {
-            struct timespec tp; clock_gettime(CLOCK_MONOTONIC, &tp);
+            struct timespec tp; tm_clock(&tp);
             uint64_t nowp = (uint64_t) tp.tv_sec * 1000000000ull + tp.tv_nsec;
-            atomic_fetch_add(&g_tm_qwait_hi_ns, nowp - g_tm_q[idx].enq_ns);
-            atomic_fetch_add(&g_tm_qhi_n, 1);
+            tm_add64(&g_tm_qwait_hi_ns, nowp - g_tm_q[idx].enq_ns);
+            tm_add64(&g_tm_qhi_n, 1);
             // QWAIT span: submit -> dequeue for THIS part, so the timeline shows exactly
             // how long each part sat in the queue before a worker picked it up.
             if (g_tm_trace_on) {
@@ -1803,17 +1812,17 @@ static void * ggml_tm_worker(void * arg) {
         g_tm_q_len--;
         g_tm_inflight++;
         struct ggml_tm_pool_tensor * t = &g_tm_pool[ti];
-        pthread_mutex_unlock(&g_tm_mtx);
+        tm_mutex_unlock(&g_tm_mtx);
 
         size_t need = t->expert_bytes + 2 * 4096;
         if (bounce_sz < need) {
-            free(bounce);
-            if (posix_memalign((void **) &bounce, 4096, need) != 0) { abort(); }
+            tm_aligned_free(bounce);
+            if (tm_aligned_alloc((void **) &bounce, need) != 0) { abort(); }
             bounce_sz = need;
         }
 
         struct timespec ts0, ts1;
-        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        tm_clock(&ts0);
         // sub-range [plo, phi) of the expert, page-aligned interior cut points
         size_t    step = (t->expert_bytes / (size_t) g_tm_split) & ~(size_t) 4095;
         size_t    plo  = (size_t) part * step;
@@ -1827,6 +1836,52 @@ static void * ggml_tm_worker(void * arg) {
         if (g_tm_fused) {
             const int L = t->layer_id;
             int fti[3] = { ggml_tm_find(L, 0), ggml_tm_find(L, 1), ggml_tm_find(L, 2) };
+#if !defined(__linux__)
+            // Windows: preadv has no equivalent, so the fused [gate|up|down] region is read
+            // in one unbuffered request into a bounce buffer and copied into the three slots.
+            // Same device request shape as Linux (one 3 x expert_bytes read), one memcpy more.
+            size_t total = 3 * t->expert_bytes;
+            size_t foff  = ggml_tm_fused_off(L, e, t->n_experts, t->expert_bytes);
+            bool ok = (fti[0] >= 0 && fti[1] >= 0 && fti[2] >= 0) && (foff % 4096 == 0);
+            if (!ok) {
+                fprintf(stderr, "temporal-pool: FATAL fused fetch misaligned (L=%d e=%d off=%zu)\n", L, e, foff);
+                abort();
+            }
+            if (bounce_sz < total) {
+                tm_aligned_free(bounce);
+                if (tm_aligned_alloc((void **) &bounce, total) != 0) { abort(); }
+                bounce_sz = total;
+            }
+            struct timespec fs0, fs1;
+            tm_clock(&fs0);
+            size_t done = 0;
+            uint64_t pf_sys = 0, pf_first = 0; int pf_n = 0;
+            while (done < total) {
+                struct timespec c0, c1;
+                if (g_tm_fetchprof) { tm_clock(&c0); }
+                tm_ssize_t r = tm_pread(fd, bounce + done, total - done, (tm_off_t)(foff + done));
+                if (g_tm_fetchprof) {
+                    tm_clock(&c1);
+                    uint64_t dt = (uint64_t)(c1.tv_sec - c0.tv_sec) * 1000000000ull
+                                + (uint64_t)(c1.tv_nsec - c0.tv_nsec);
+                    pf_sys += dt; if (pf_n == 0) { pf_first = dt; }
+                    pf_n++;
+                    if (r > 0 && (size_t) r < total - done) { tm_add64(&g_tm_pf_short, 1); }
+                    uint64_t prev = tm_load64(&g_tm_pf_max_ns);
+                    while (dt > prev && !tm_cas64(&g_tm_pf_max_ns, &prev, dt)) { }
+                }
+                if (r <= 0) {
+                    fprintf(stderr, "temporal-pool: FATAL fused read failed (off=%zu): %s\n", foff + done, tm_errstr());
+                    abort();
+                }
+                done += (size_t) r;
+            }
+            for (int k = 0; k < 3; k++) {
+                memcpy((uint8_t *) g_tm_pool[fti[k]].data + (size_t) e * g_tm_pool[fti[k]].expert_bytes,
+                       bounce + (size_t) k * t->expert_bytes, t->expert_bytes);
+            }
+            tm_clock(&fs1);
+#else
             struct iovec iov[3];
             bool ok = (fti[0] >= 0 && fti[1] >= 0 && fti[2] >= 0);
             for (int k = 0; ok && k < 3; k++) {
@@ -1842,7 +1897,7 @@ static void * ggml_tm_worker(void * arg) {
                 abort();
             }
             struct timespec fs0, fs1;
-            clock_gettime(CLOCK_MONOTONIC, &fs0);
+            tm_clock(&fs0);
             size_t total = 3 * t->expert_bytes, done = 0;
             uint64_t pf_sys = 0, pf_first = 0; int pf_n = 0;
             while (done < total) {
@@ -1854,55 +1909,56 @@ static void * ggml_tm_worker(void * arg) {
                     nv++; skip = 0;
                 }
                 struct timespec c0, c1;
-                if (g_tm_fetchprof) { clock_gettime(CLOCK_MONOTONIC, &c0); }
+                if (g_tm_fetchprof) { tm_clock(&c0); }
                 ssize_t r = preadv(fd, cur, nv, (off_t)(foff + done));
                 if (g_tm_fetchprof) {
-                    clock_gettime(CLOCK_MONOTONIC, &c1);
+                    tm_clock(&c1);
                     uint64_t dt = (uint64_t)(c1.tv_sec - c0.tv_sec) * 1000000000ull
                                 + (uint64_t)(c1.tv_nsec - c0.tv_nsec);
                     pf_sys += dt; if (pf_n == 0) { pf_first = dt; }
                     pf_n++;
                     size_t asked = 0; for (int q = 0; q < nv; q++) { asked += cur[q].iov_len; }
-                    if (r > 0 && (size_t) r < asked) { atomic_fetch_add(&g_tm_pf_short, 1); }
-                    uint64_t prev = atomic_load(&g_tm_pf_max_ns);
-                    while (dt > prev && !atomic_compare_exchange_weak(&g_tm_pf_max_ns, &prev, dt)) { }
+                    if (r > 0 && (size_t) r < asked) { tm_add64(&g_tm_pf_short, 1); }
+                    uint64_t prev = tm_load64(&g_tm_pf_max_ns);
+                    while (dt > prev && !tm_cas64(&g_tm_pf_max_ns, &prev, dt)) { }
                 }
                 if (r <= 0) {
                     fprintf(stderr, "temporal-pool: FATAL fused preadv failed (off=%zu): %s\n",
-                            foff + done, strerror(errno));
+                            foff + done, tm_errstr());
                     abort();
                 }
                 done += (size_t) r;
             }
-            clock_gettime(CLOCK_MONOTONIC, &fs1);
+            tm_clock(&fs1);
+#endif
             if (g_tm_fetchprof) {
-                atomic_fetch_add(&g_tm_pf_calls, (uint64_t) pf_n);
-                atomic_fetch_add(&g_tm_pf_fetches, 1);
-                atomic_fetch_add(&g_tm_pf_sys_ns, pf_sys);
-                atomic_fetch_add(&g_tm_pf_first_ns, pf_first);
-                atomic_fetch_add(&g_tm_pf_wall_ns,
+                tm_add64(&g_tm_pf_calls, (uint64_t) pf_n);
+                tm_add64(&g_tm_pf_fetches, 1);
+                tm_add64(&g_tm_pf_sys_ns, pf_sys);
+                tm_add64(&g_tm_pf_first_ns, pf_first);
+                tm_add64(&g_tm_pf_wall_ns,
                     (uint64_t)(fs1.tv_sec - fs0.tv_sec) * 1000000000ull
                   + (uint64_t)(fs1.tv_nsec - fs0.tv_nsec));
             }
-            atomic_fetch_add(&g_tm_fetch_ns, (uint64_t)(fs1.tv_sec - fs0.tv_sec) * 1000000000ull
+            tm_add64(&g_tm_fetch_ns, (uint64_t)(fs1.tv_sec - fs0.tv_sec) * 1000000000ull
                                              + (uint64_t)(fs1.tv_nsec - fs0.tv_nsec));
-            atomic_fetch_add(&g_tm_fetched_bytes, total);
+            tm_add64(&g_tm_fetched_bytes, total);
             tm_ev(tm_us(&fs0), tm_us(&fs1) - tm_us(&fs0), 100 + wid, 2 /*FETCH*/, L, e);
-            pthread_mutex_lock(&g_tm_mtx);
-            if (--g_tm_inflight == 0 && g_tm_q_n == 0) { pthread_cond_broadcast(&g_tm_quiet_cv); }
+            tm_mutex_lock(&g_tm_mtx);
+            if (--g_tm_inflight == 0 && g_tm_q_n == 0) { tm_cond_broadcast(&g_tm_quiet_cv); }
             for (int k = 0; k < 3; k++) {
                 struct ggml_tm_pool_tensor * ft = &g_tm_pool[fti[k]];
                 if (ft->pending[e] && --ft->pending[e] == 0) {
-                    __atomic_store_n(&ft->state[e], GGML_TM_RESIDENT, __ATOMIC_RELEASE);
+                    tm_store8_rel(&ft->state[e], GGML_TM_RESIDENT);
                     ft->n_resident++;
                     ft->fifo[(ft->fifo_head + ft->fifo_len) % ft->n_experts] = e;
                     ft->fifo_len = ft->fifo_len < ft->n_experts ? ft->fifo_len + 1 : ft->fifo_len;
-                    atomic_fetch_add(&g_tm_fetches, 1);
+                    tm_add64(&g_tm_fetches, 1);
                     if (ft->evict_pending[e]) { ft->evict_pending[e] = 0; ggml_tm_evict(ft, e); }
                 }
             }
-            pthread_cond_broadcast(&g_tm_done_cv);
-            pthread_mutex_unlock(&g_tm_mtx);
+            tm_cond_broadcast(&g_tm_done_cv);
+            tm_mutex_unlock(&g_tm_mtx);
             continue;
         }
 
@@ -1917,46 +1973,46 @@ static void * ggml_tm_worker(void * arg) {
             && (((uintptr_t) dst) % 4096 == 0)
             && (sub_bytes % 4096 == 0);
         if (zerocopy) {
-            static _Atomic int announced = 0;
-            if (atomic_exchange(&announced, 1) == 0) {
+            static tm_ai32_t announced = 0;
+            if (tm_xchg32(&announced, 1) == 0) {
                 fprintf(stderr, "temporal-pool: O_DIRECT zero-copy fetch ENABLED (no bounce memcpy)\n");
             }
             size_t left = sub_bytes;
-            off_t  fo   = (off_t) ebeg;
+            tm_off_t fo = (tm_off_t) ebeg;
             uint8_t * dp = dst;
             uint64_t zp_sys = 0, zp_first = 0; int zp_n = 0;
             while (left > 0) {
                 struct timespec c0, c1;
-                if (g_tm_fetchprof) { clock_gettime(CLOCK_MONOTONIC, &c0); }
-                ssize_t r = pread(fd, dp, left, fo);
+                if (g_tm_fetchprof) { tm_clock(&c0); }
+                tm_ssize_t r = tm_pread(fd, dp, left, fo);
                 if (g_tm_fetchprof) {
-                    clock_gettime(CLOCK_MONOTONIC, &c1);
+                    tm_clock(&c1);
                     uint64_t dt = (uint64_t)(c1.tv_sec - c0.tv_sec) * 1000000000ull
                                 + (uint64_t)(c1.tv_nsec - c0.tv_nsec);
                     zp_sys += dt; if (zp_n == 0) { zp_first = dt; }
                     zp_n++;
-                    if (r > 0 && (size_t) r < left) { atomic_fetch_add(&g_tm_pf_short, 1); }
-                    uint64_t prev = atomic_load(&g_tm_pf_max_ns);
-                    while (dt > prev && !atomic_compare_exchange_weak(&g_tm_pf_max_ns, &prev, dt)) { }
+                    if (r > 0 && (size_t) r < left) { tm_add64(&g_tm_pf_short, 1); }
+                    uint64_t prev = tm_load64(&g_tm_pf_max_ns);
+                    while (dt > prev && !tm_cas64(&g_tm_pf_max_ns, &prev, dt)) { }
                 }
                 if (r <= 0) {
                     fprintf(stderr, "temporal-pool: FATAL zero-copy pread failed (off=%lld len=%zu): %s\n",
-                            (long long) fo, left, strerror(errno));
+                            (long long) fo, left, tm_errstr());
                     abort();
                 }
                 dp += r; fo += r; left -= (size_t) r;
             }
             if (g_tm_fetchprof) {
-                atomic_fetch_add(&g_tm_pf_calls, (uint64_t) zp_n);
-                atomic_fetch_add(&g_tm_pf_fetches, 1);
-                atomic_fetch_add(&g_tm_pf_sys_ns, zp_sys);
-                atomic_fetch_add(&g_tm_pf_first_ns, zp_first);
+                tm_add64(&g_tm_pf_calls, (uint64_t) zp_n);
+                tm_add64(&g_tm_pf_fetches, 1);
+                tm_add64(&g_tm_pf_sys_ns, zp_sys);
+                tm_add64(&g_tm_pf_first_ns, zp_first);
             }
         } else if (g_tm_odirect) {
             // O_DIRECT needs 4K-aligned offset/length/buffer: read the aligned superset
             // into the bounce buffer, copy the sub-range's exact bytes into place.
-            static _Atomic int warned = 0;
-            if (atomic_exchange(&warned, 1) == 0) {
+            static tm_ai32_t warned = 0;
+            if (tm_xchg32(&warned, 1) == 0) {
                 fprintf(stderr, "temporal-pool: O_DIRECT bounce path (off%%4096=%zu dst%%4096=%zu len%%4096=%zu)"
                                 " -- costs a memcpy per fetch\n",
                         ebeg % 4096, ((uintptr_t) dst) % 4096, sub_bytes % 4096);
@@ -1965,13 +2021,14 @@ static void * ggml_tm_worker(void * arg) {
             size_t aend = (ebeg + sub_bytes + 4095) & ~(size_t) 4095;
             size_t left = aend - abeg;
             uint8_t * bp = bounce;
-            off_t     fo = (off_t) abeg;
+            tm_off_t  fo = (tm_off_t) abeg;
             // RWF_HIPRI (polled completion) saves the interrupt+wakeup tail when the
             // block driver supports poll queues; detected once, silent fallback if not.
-            static _Atomic int hipri = -1;   // -1 probe, 1 use, 0 unsupported
+            static tm_ai32_t hipri = -1;   // -1 probe, 1 use, 0 unsupported
             while (left > 0) {
-                ssize_t r = -1;
-                int h = atomic_load(&hipri);
+                tm_ssize_t r = -1;
+                int h = tm_load32(&hipri);
+#if defined(__linux__)
                 if (h != 0) {
                     struct iovec iov = { bp, left };
                     // pos_l/pos_h: the kernel assembles pos as (hi << 64)|lo on 64-bit
@@ -1980,15 +2037,18 @@ static void * ggml_tm_worker(void * arg) {
                     // the wrong file region -- caught by the PPL gate as nan.
                     r = syscall(__NR_preadv2, fd, &iov, 1,
                                 (unsigned long) fo, 0ul, RWF_HIPRI);
-                    if (r < 0 && h == -1) { atomic_store(&hipri, 0); }
-                    else if (h == -1)     { atomic_store(&hipri, 1); }
+                    if (r < 0 && h == -1) { tm_store32(&hipri, 0); }
+                    else if (h == -1)     { tm_store32(&hipri, 1); }
                 }
+#else
+                (void) h;   // no polled-completion read flag on Windows; plain unbuffered read
+#endif
                 if (r < 0) {
-                    r = pread(fd, bp, left, fo);
+                    r = tm_pread(fd, bp, left, fo);
                 }
                 if (r <= 0) {
                     fprintf(stderr, "temporal-pool: FATAL O_DIRECT pread failed (off=%lld len=%zu): %s\n",
-                            (long long) fo, left, strerror(errno));
+                            (long long) fo, left, tm_errstr());
                     abort();   // computing on stale/zero weights must never be silent
                 }
                 bp += r; fo += r; left -= (size_t) r;
@@ -1996,45 +2056,45 @@ static void * ggml_tm_worker(void * arg) {
             memcpy(dst, bounce + (ebeg - abeg), sub_bytes);
         } else {
             size_t left = sub_bytes;
-            off_t  fo   = (off_t) ebeg;
+            tm_off_t fo = (tm_off_t) ebeg;
             uint8_t * dp = dst;
             while (left > 0) {
-                ssize_t r = pread(fd, dp, left, fo);
+                tm_ssize_t r = tm_pread(fd, dp, left, fo);
                 if (r <= 0) {
                     fprintf(stderr, "temporal-pool: FATAL pread failed (off=%lld): %s\n",
-                            (long long) fo, strerror(errno));
+                            (long long) fo, tm_errstr());
                     abort();
                 }
                 dp += r; fo += r; left -= (size_t) r;
             }
             // drop what the read left in the gguf's PAGE CACHE, or the next fetch of
             // this expert is a free cache hit and the regime silently stops streaming
-            posix_fadvise(fd, (off_t)(ebeg & ~(size_t) 4095),
-                          (off_t)(sub_bytes + 4096), POSIX_FADV_DONTNEED);
+            tm_fadvise_dontneed(fd, (tm_off_t)(ebeg & ~(size_t) 4095),
+                                (tm_off_t)(sub_bytes + 4096));
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts1);
-        atomic_fetch_add(&g_tm_fetch_ns, (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000ull
+        tm_clock(&ts1);
+        tm_add64(&g_tm_fetch_ns, (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000ull
                                          + (uint64_t)(ts1.tv_nsec - ts0.tv_nsec));
-        atomic_fetch_add(&g_tm_fetched_bytes, sub_bytes);
+        tm_add64(&g_tm_fetched_bytes, sub_bytes);
         if (g_tm_fetchprof) {
-            atomic_fetch_add(&g_tm_pf_wall_ns, (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000ull
+            tm_add64(&g_tm_pf_wall_ns, (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000ull
                                              + (uint64_t)(ts1.tv_nsec - ts0.tv_nsec));
         }
         tm_ev(tm_us(&ts0), tm_us(&ts1) - tm_us(&ts0), 100 + wid, 2 /*FETCH*/, t->layer_id, e);
 
-        pthread_mutex_lock(&g_tm_mtx);
+        tm_mutex_lock(&g_tm_mtx);
         if (--g_tm_inflight == 0 && g_tm_q_n == 0) {
-            pthread_cond_broadcast(&g_tm_quiet_cv);   // fetch burst drained
+            tm_cond_broadcast(&g_tm_quiet_cv);   // fetch burst drained
         }
         if (--t->pending[e] == 0) {
             // release store: pairs with the acquire fast path in ggml_tm_wait_expert --
             // a thread seeing RESIDENT without the mutex also sees ALL sub-reads' bytes
-            __atomic_store_n(&t->state[e], GGML_TM_RESIDENT, __ATOMIC_RELEASE);
+            tm_store8_rel(&t->state[e], GGML_TM_RESIDENT);
             t->n_resident++;
             t->fifo[(t->fifo_head + t->fifo_len) % t->n_experts] = e;
             t->fifo_len = t->fifo_len < t->n_experts ? t->fifo_len + 1 : t->fifo_len;
-            atomic_fetch_add(&g_tm_fetches, 1);   // counted per EXPERT, not per sub-read
-            pthread_cond_broadcast(&g_tm_done_cv);
+            tm_add64(&g_tm_fetches, 1);   // counted per EXPERT, not per sub-read
+            tm_cond_broadcast(&g_tm_done_cv);
             if (t->evict_pending[e]) {
                 // a swap requested eviction while this was in flight -- honor it now that
                 // it is RESIDENT, so residency stays strictly bounded (no leak).
@@ -2042,11 +2102,15 @@ static void * ggml_tm_worker(void * arg) {
                 ggml_tm_evict(t, e);
             }
         }
-        pthread_mutex_unlock(&g_tm_mtx);
+        tm_mutex_unlock(&g_tm_mtx);
     }
-    return NULL;
+    TM_THREAD_RETURN;
 }
 
+static bool g_tm_uring        = false;   // LLAMA_TEMPORAL_URING (Linux-only path below)
+static bool g_tm_uring_sqpoll = false;   // LLAMA_TEMPORAL_URING_SQPOLL
+static bool g_tm_uring_iopoll = false;   // LLAMA_TEMPORAL_URING_IOPOLL
+#if defined(__linux__)
 // ---------------------------------------------------------------------------
 // io_uring fetch path (LLAMA_TEMPORAL_URING=1)
 //
@@ -2073,9 +2137,6 @@ static int tm_uring_register(int fd, unsigned op, void * arg, unsigned nr) {
     return (int) syscall(__NR_io_uring_register, fd, op, arg, nr);
 }
 
-static bool g_tm_uring        = false;   // LLAMA_TEMPORAL_URING
-static bool g_tm_uring_sqpoll = false;   // LLAMA_TEMPORAL_URING_SQPOLL
-static bool g_tm_uring_iopoll = false;   // LLAMA_TEMPORAL_URING_IOPOLL
 
 #define TM_UR_DEPTH 64
 
@@ -2103,26 +2164,26 @@ static void ggml_tm_part_geom(int ti, int e, int part,
 // completion bookkeeping for one part -- the tail of ggml_tm_worker, verbatim in effect
 static void ggml_tm_finish_part(int ti, int e) {
     struct ggml_tm_pool_tensor * t = &g_tm_pool[ti];
-    pthread_mutex_lock(&g_tm_mtx);
+    tm_mutex_lock(&g_tm_mtx);
     if (--g_tm_inflight == 0 && g_tm_q_n == 0) {
-        pthread_cond_broadcast(&g_tm_quiet_cv);
+        tm_cond_broadcast(&g_tm_quiet_cv);
     }
     if (--t->pending[e] == 0) {
-        __atomic_store_n(&t->state[e], GGML_TM_RESIDENT, __ATOMIC_RELEASE);
+        tm_store8_rel(&t->state[e], GGML_TM_RESIDENT);
         t->n_resident++;
         t->fifo[(t->fifo_head + t->fifo_len) % t->n_experts] = e;
         t->fifo_len = t->fifo_len < t->n_experts ? t->fifo_len + 1 : t->fifo_len;
-        atomic_fetch_add(&g_tm_fetches, 1);
-        pthread_cond_broadcast(&g_tm_done_cv);
+        tm_add64(&g_tm_fetches, 1);
+        tm_cond_broadcast(&g_tm_done_cv);
         if (t->evict_pending[e]) {
             t->evict_pending[e] = 0;
             ggml_tm_evict(t, e);
         }
     }
-    pthread_mutex_unlock(&g_tm_mtx);
+    tm_mutex_unlock(&g_tm_mtx);
 }
 
-static void * ggml_tm_uring_worker(void * arg) {
+TM_THREAD_FN(ggml_tm_uring_worker) {
     (void) arg;
     ggml_tm_set_io_affinity();
     int fd = open(g_tm_path, O_RDONLY | (g_tm_odirect ? O_DIRECT : 0));
@@ -2188,9 +2249,9 @@ static void * ggml_tm_uring_worker(void * arg) {
         // ---- 1. take every queued part we have room for (HI class first) ----
         int fresh[TM_UR_DEPTH];
         int nfresh = 0;
-        pthread_mutex_lock(&g_tm_mtx);
+        tm_mutex_lock(&g_tm_mtx);
         while (g_tm_q_len == 0 && inflight == 0) {
-            pthread_cond_wait(&g_tm_work_cv, &g_tm_mtx);
+            tm_cond_wait(&g_tm_work_cv, &g_tm_mtx);
         }
         while (g_tm_q_len > 0 && inflight + nfresh < TM_UR_DEPTH) {
             int pick = -1;
@@ -2202,10 +2263,10 @@ static void * ggml_tm_uring_worker(void * arg) {
             if (pick < 0) break;
             int idx = (g_tm_q_head + pick) % GGML_TM_QCAP;
             if (g_tm_q[idx].cls == 0) {
-                struct timespec tp; clock_gettime(CLOCK_MONOTONIC, &tp);
+                struct timespec tp; tm_clock(&tp);
                 uint64_t nowp = (uint64_t) tp.tv_sec * 1000000000ull + tp.tv_nsec;
-                atomic_fetch_add(&g_tm_qwait_hi_ns, nowp - g_tm_q[idx].enq_ns);
-                atomic_fetch_add(&g_tm_qhi_n, 1);
+                tm_add64(&g_tm_qwait_hi_ns, nowp - g_tm_q[idx].enq_ns);
+                tm_add64(&g_tm_qhi_n, 1);
             }
             // find a free slot in the in-flight table
             int slot = -1;
@@ -2226,11 +2287,11 @@ static void * ggml_tm_uring_worker(void * arg) {
             g_tm_inflight++;
             fresh[nfresh++] = slot;
         }
-        pthread_mutex_unlock(&g_tm_mtx);
+        tm_mutex_unlock(&g_tm_mtx);
 
         // ---- 2. build one SQE per part, submit the whole burst in one enter ----
         if (nfresh > 0) {
-            struct timespec tsub; clock_gettime(CLOCK_MONOTONIC, &tsub);
+            struct timespec tsub; tm_clock(&tsub);
             uint64_t sub_ns = (uint64_t) tsub.tv_sec * 1000000000ull + tsub.tv_nsec;
             for (int i = 0; i < nfresh; i++) {
                 int s = fresh[i];
@@ -2243,15 +2304,15 @@ static void * ggml_tm_uring_worker(void * arg) {
                     // O_DIRECT cannot DMA into an unaligned slot; the pread path bounces
                     // here. Rather than build a second bounce mechanism inside the ring,
                     // do this rare part synchronously and complete it immediately.
-                    static _Atomic int warned = 0;
-                    if (atomic_exchange(&warned, 1) == 0) {
+                    static tm_ai32_t warned = 0;
+                    if (tm_xchg32(&warned, 1) == 0) {
                         fprintf(stderr, "temporal-pool: uring unaligned part -> sync pread "
                                         "fallback (off%%4096=%zu len%%4096=%zu)\n",
                                 ebeg % 4096, sub_bytes % 4096);
                     }
                     size_t left = sub_bytes; off_t fo = (off_t) ebeg; uint8_t * dp = dst;
                     while (left > 0) {
-                        ssize_t r = pread(fd, dp, left, fo);
+                        tm_ssize_t r = tm_pread(fd, dp, left, fo);
                         if (r <= 0) {
                             fprintf(stderr, "temporal-pool: FATAL uring fallback pread: %s\n",
                                     strerror(errno));
@@ -2259,7 +2320,7 @@ static void * ggml_tm_uring_worker(void * arg) {
                         }
                         dp += r; fo += r; left -= (size_t) r;
                     }
-                    atomic_fetch_add(&g_tm_fetched_bytes, sub_bytes);
+                    tm_add64(&g_tm_fetched_bytes, sub_bytes);
                     int ti = req[s].ti, e = req[s].e;
                     req[s].busy = false;
                     ggml_tm_finish_part(ti, e);
@@ -2312,14 +2373,14 @@ static void * ggml_tm_uring_worker(void * arg) {
                 } else {
                     // only block when there is nothing else to submit
                     bool more;
-                    pthread_mutex_lock(&g_tm_mtx);
+                    tm_mutex_lock(&g_tm_mtx);
                     more = g_tm_q_len > 0;
-                    pthread_mutex_unlock(&g_tm_mtx);
+                    tm_mutex_unlock(&g_tm_mtx);
                     if (more) { continue; }
                     tm_uring_enter(ring, 0, 1, IORING_ENTER_GETEVENTS);
                 }
             }
-            struct timespec tc; clock_gettime(CLOCK_MONOTONIC, &tc);
+            struct timespec tc; tm_clock(&tc);
             uint64_t now_ns = (uint64_t) tc.tv_sec * 1000000000ull + tc.tv_nsec;
             while (__atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) != *cq_head) {
                 struct io_uring_cqe * c = &cqes[*cq_head & *cq_mask];
@@ -2337,8 +2398,8 @@ static void * ggml_tm_uring_worker(void * arg) {
                 }
                 if ((size_t) res < req[s].left) {
                     // short read: resubmit the remainder rather than compute on a hole
-                    atomic_fetch_add(&g_tm_pf_short, 1);
-                    atomic_fetch_add(&g_tm_fetched_bytes, (uint64_t) res);
+                    tm_add64(&g_tm_pf_short, 1);
+                    tm_add64(&g_tm_fetched_bytes, (uint64_t) res);
                     req[s].dst  += res;
                     req[s].off  += res;
                     req[s].left -= (size_t) res;
@@ -2359,19 +2420,19 @@ static void * ggml_tm_uring_worker(void * arg) {
                     continue;                      // still in flight
                 }
                 uint64_t dt = now_ns - req[s].t0;
-                atomic_fetch_add(&g_tm_fetch_ns, dt);
-                atomic_fetch_add(&g_tm_fetched_bytes, (uint64_t) res);
+                tm_add64(&g_tm_fetch_ns, dt);
+                tm_add64(&g_tm_fetched_bytes, (uint64_t) res);
                 if (g_tm_fetchprof) {
                     // wall == sys by construction here: the "syscall" is the ring, and
                     // what is timed is submit -> completion for one part. outside_sys is
                     // therefore not meaningful in this arm; wall/fetch still is.
-                    atomic_fetch_add(&g_tm_pf_calls, 1);
-                    atomic_fetch_add(&g_tm_pf_fetches, 1);
-                    atomic_fetch_add(&g_tm_pf_sys_ns, dt);
-                    atomic_fetch_add(&g_tm_pf_wall_ns, dt);
-                    atomic_fetch_add(&g_tm_pf_first_ns, dt);
-                    uint64_t prev = atomic_load(&g_tm_pf_max_ns);
-                    while (dt > prev && !atomic_compare_exchange_weak(&g_tm_pf_max_ns, &prev, dt)) { }
+                    tm_add64(&g_tm_pf_calls, 1);
+                    tm_add64(&g_tm_pf_fetches, 1);
+                    tm_add64(&g_tm_pf_sys_ns, dt);
+                    tm_add64(&g_tm_pf_wall_ns, dt);
+                    tm_add64(&g_tm_pf_first_ns, dt);
+                    uint64_t prev = tm_load64(&g_tm_pf_max_ns);
+                    while (dt > prev && !tm_cas64(&g_tm_pf_max_ns, &prev, dt)) { }
                 }
                 int ti = req[s].ti, e = req[s].e;
                 if (g_tm_trace_on) {
@@ -2386,10 +2447,12 @@ static void * ggml_tm_uring_worker(void * arg) {
             }
         }
     }
-    return NULL;
+    TM_THREAD_RETURN;
 }
 
-static void * ggml_tm_janitor(void * arg);
+#endif // __linux__ io_uring
+
+TM_THREAD_FN(ggml_tm_janitor);
 
 void ggml_temporal_pool_set_fused_base(size_t base) { g_tm_fused_base = base; }
 
@@ -2431,7 +2494,7 @@ void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int 
         if (en && atoi(en)) { g_tm_enforce = true; }
         if (getenv("LLAMA_TEMPORAL_TWOPASS")) { g_tm_twopass = true; g_tm_enforce = true; }
         if (getenv("LLAMA_TEMPORAL_TRACE")) {
-            clock_gettime(CLOCK_MONOTONIC, &g_tm_trace_t0);
+            tm_clock(&g_tm_trace_t0);
             g_tm_trace_on = true;
             atexit(tm_trace_dump);
         }
@@ -2442,10 +2505,10 @@ void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int 
         }
     }
     if (g_tm_R < 0 || n_experts <= 1 || nbytes % (size_t) n_experts != 0) {
-        if (fd >= 0) { close(fd); }
+        if (fd >= 0) { tm_close_fd(fd); }
         return;
     }
-    pthread_mutex_lock(&g_tm_mtx);
+    tm_mutex_lock(&g_tm_mtx);
     if (g_tm_pool_n < (int)(sizeof(g_tm_pool)/sizeof(g_tm_pool[0]))) {
         struct ggml_tm_pool_tensor * t = &g_tm_pool[g_tm_pool_n++];
         t->data         = data;
@@ -2487,6 +2550,7 @@ void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int 
 
         // resolve the gguf path once; fetch workers open their own fds from it
         if (!g_tm_path[0]) {
+#if defined(__linux__)
             char linkp[64];
             snprintf(linkp, sizeof(linkp), "/proc/self/fd/%d", fd);
             ssize_t n = readlink(linkp, g_tm_path, sizeof(g_tm_path) - 1);
@@ -2495,32 +2559,37 @@ void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int 
                 abort();
             }
             g_tm_path[n] = '\0';
+#else
+            if (tm_fd_path(fd, g_tm_path, sizeof(g_tm_path)) <= 0) {
+                fprintf(stderr, "temporal-pool: FATAL GetFinalPathNameByHandle(fd=%d) failed: %s\n", fd, tm_errstr());
+                abort();
+            }
+#endif
         }
         if (!g_tm_odirect) {
             // suppress readahead so a fetch of expert e does not warm its neighbours
-            posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            tm_fadvise_random(fd);
         }
         if (!g_tm_workers_started) {
             g_tm_workers_started = true;
             if (g_tm_uring) {
+#if defined(__linux__)
                 // ONE submitter: the whole point is that every part of a burst enters
                 // the block layer from the same context, in one syscall.
-                pthread_t ut;
-                pthread_create(&ut, NULL, ggml_tm_uring_worker, NULL);
-                pthread_detach(ut);
+                tm_thread_detached(ggml_tm_uring_worker, NULL);
+#else
+                fprintf(stderr, "temporal-pool: FATAL LLAMA_TEMPORAL_URING is Linux-only\n");
+                abort();
+#endif
             } else {
             for (int i = 0; i < g_tm_nworkers; i++) {
-                pthread_t th;
-                pthread_create(&th, NULL, ggml_tm_worker, (void *)(intptr_t) i);
-                pthread_detach(th);
+                tm_thread_detached(ggml_tm_worker, (void *)(intptr_t) i);
             }
             }
-            pthread_t jt;
-            pthread_create(&jt, NULL, ggml_tm_janitor, NULL);
-            pthread_detach(jt);
+            tm_thread_detached(ggml_tm_janitor, NULL);
         }
     }
-    pthread_mutex_unlock(&g_tm_mtx);
+    tm_mutex_unlock(&g_tm_mtx);
 }
 
 // the madvise itself: free ONLY pages fully inside the expert's range (align start up,
@@ -2555,7 +2624,7 @@ static void ggml_tm_madvise_range(struct ggml_tm_pool_tensor * t, int e) {
         const char * v = getenv("LLAMA_TEMPORAL_MADV_FREE");
         use_free = (v && atoi(v)) ? 1 : 0;
     }
-    madvise(abeg, (size_t)(aend - abeg), use_free ? MADV_FREE : MADV_DONTNEED);
+    tm_madvise(abeg, (size_t)(aend - abeg), use_free);
 }
 
 static bool ggml_tm_submit(int ti, int e);   // fwd: janitor resubmits evicted-but-needed
@@ -2574,7 +2643,7 @@ static void ggml_tm_evict(struct ggml_tm_pool_tensor * t, int e) {
     }
     if (t->state[e] != GGML_TM_RESIDENT) return;
     t->n_resident--;
-    atomic_fetch_add(&g_tm_evictions, 1);
+    tm_add64(&g_tm_evictions, 1);
     if (g_tm_jq_len >= GGML_TM_QCAP) {
         ggml_tm_madvise_range(t, e);
         t->state[e] = GGML_TM_ABSENT;
@@ -2584,7 +2653,7 @@ static void ggml_tm_evict(struct ggml_tm_pool_tensor * t, int e) {
     g_tm_jq[(g_tm_jq_head + g_tm_jq_len) % GGML_TM_QCAP].ti = (int)(t - g_tm_pool);
     g_tm_jq[(g_tm_jq_head + g_tm_jq_len) % GGML_TM_QCAP].e  = e;
     g_tm_jq_len++;
-    pthread_cond_signal(&g_tm_jan_cv);
+    tm_cond_signal(&g_tm_jan_cv);
 }
 
 // enqueue a fetch (caller holds g_tm_mtx). Own-needed before siblings, so FIFO order
@@ -2615,7 +2684,7 @@ static bool ggml_tm_submit2(int ti, int e, int cls) {
     }
     if (t->state[e] != GGML_TM_ABSENT) return true;    // resident or already in flight
     if (g_tm_q_n + g_tm_split > GGML_TM_QCAP) return false;   // full -- caller decides
-    struct timespec tp; clock_gettime(CLOCK_MONOTONIC, &tp);
+    struct timespec tp; tm_clock(&tp);
     uint64_t now = (uint64_t) tp.tv_sec * 1000000000ull + tp.tv_nsec;
     t->state[e]   = GGML_TM_FETCHING;
     t->pending[e] = (uint8_t) g_tm_split;
@@ -2629,7 +2698,7 @@ static bool ggml_tm_submit2(int ti, int e, int cls) {
         g_tm_q_n++;
         g_tm_q_len++;
     }
-    pthread_cond_broadcast(&g_tm_work_cv);   // up to `split` workers can start at once
+    tm_cond_broadcast(&g_tm_work_cv);   // up to `split` workers can start at once
     return true;
 }
 static bool ggml_tm_submit(int ti, int e) { return ggml_tm_submit2(ti, e, 0); }
@@ -2652,7 +2721,7 @@ static bool ggml_tm_submit_fused(int layer, int e) {
     }
     if (need == 0) return true;                  // already resident or already in flight
     if (g_tm_q_n + 1 > GGML_TM_QCAP) return false;
-    struct timespec tp; clock_gettime(CLOCK_MONOTONIC, &tp);
+    struct timespec tp; tm_clock(&tp);
     uint64_t now = (uint64_t) tp.tv_sec * 1000000000ull + tp.tv_nsec;
     for (int k = 0; k < 3; k++) {
         struct ggml_tm_pool_tensor * t = &g_tm_pool[ti[k]];
@@ -2662,17 +2731,17 @@ static bool ggml_tm_submit_fused(int layer, int e) {
     g_tm_q[slot].ti = ti[0]; g_tm_q[slot].e = e; g_tm_q[slot].part = 0;
     g_tm_q[slot].cls = 0;    g_tm_q[slot].enq_ns = now;
     g_tm_q_n++; g_tm_q_len++;
-    pthread_cond_broadcast(&g_tm_work_cv);
+    tm_cond_broadcast(&g_tm_work_cv);
     return true;
 }
 
-static void * ggml_tm_janitor(void * arg) {
+TM_THREAD_FN(ggml_tm_janitor) {
     (void) arg;
     ggml_tm_set_io_affinity();
-    pthread_mutex_lock(&g_tm_mtx);
+    tm_mutex_lock(&g_tm_mtx);
     for (;;) {
         while (g_tm_jq_len == 0) {
-            pthread_cond_wait(&g_tm_jan_cv, &g_tm_mtx);
+            tm_cond_wait(&g_tm_jan_cv, &g_tm_mtx);
         }
         int ti = g_tm_jq[g_tm_jq_head].ti;
         int e  = g_tm_jq[g_tm_jq_head].e;
@@ -2705,7 +2774,7 @@ static void * ggml_tm_janitor(void * arg) {
         }
         if (g_tm_evict_defer) {
             while ((g_tm_inflight > 0 || g_tm_q_n > 0) && g_tm_jq_len < GGML_TM_QCAP / 2) {
-                pthread_cond_wait(&g_tm_quiet_cv, &g_tm_mtx);
+                tm_cond_wait(&g_tm_quiet_cv, &g_tm_mtx);
             }
         }
         static int nolock = -1;
@@ -2713,17 +2782,17 @@ static void * ggml_tm_janitor(void * arg) {
             const char * v = getenv("LLAMA_TEMPORAL_JANITOR_NOLOCK");
             nolock = (v && atoi(v)) ? 1 : 0;
         }
-        if (nolock) { pthread_mutex_unlock(&g_tm_mtx); }
+        if (nolock) { tm_mutex_unlock(&g_tm_mtx); }
         { double _t0 = tm_now(); ggml_tm_madvise_range(t, e); tm_ev(_t0, tm_now() - _t0, 200 /*janitor*/, 3 /*EVICT*/, t->layer_id, e); }
-        if (nolock) { pthread_mutex_lock(&g_tm_mtx); }
+        if (nolock) { tm_mutex_lock(&g_tm_mtx); }
         t->state[e] = GGML_TM_ABSENT;
         // evicted-then-needed (swap-prob turnover, streamed evict-all): refetch now.
         if (t->needed[e]) {
             ggml_tm_submit(ti, e);
         }
-        pthread_cond_broadcast(&g_tm_done_cv);
+        tm_cond_broadcast(&g_tm_done_cv);
     }
-    return NULL;
+    TM_THREAD_RETURN;
 }
 
 static inline uint64_t ggml_tm_rand(void) {
@@ -2757,7 +2826,7 @@ static void ggml_tm_enforce_advance(int L, int K, int E) {
     do { a = (int)(ggml_tm_lrand(L) % (uint64_t) E); } while (g_tm_ein[L][a]);  // admit non-resident
     g_tm_ein[L][ g_tm_ewin[L][s] ] = 0;                  // evict old
     g_tm_ewin[L][s] = a; g_tm_ein[L][a] = 1;             // admit new
-    atomic_fetch_add(&g_tm_swaps, 1);
+    tm_add64(&g_tm_swaps, 1);
 }
 
 // ---- two-pass enforce: materialize the window into an ids tensor ----------------------
@@ -2787,7 +2856,7 @@ void ggml_temporal_window_fill(struct ggml_tensor * dst, int ith, int nth, void 
         else if (g_tm_pool[i].slot == 1) ti_u = i;
         else if (g_tm_pool[i].slot == 2) ti_d = i;
     }
-    pthread_mutex_lock(&g_tm_mtx);
+    tm_mutex_lock(&g_tm_mtx);
     if (g_tm_ewin_k[L] == 0) {                            // init: window {0..K-1}, all fetched
         g_tm_ernd[L] = 0x9E3779B97F4A7C15ull ^ (0x100000001b3ull * (uint64_t)(L + 1));
         for (int j = 0; j < K; j++) { g_tm_ewin[L][j] = j; g_tm_ein[L][j] = 1;
@@ -2811,9 +2880,9 @@ void ggml_temporal_window_fill(struct ggml_tensor * dst, int ith, int nth, void 
         if (ti_g>=0) ggml_tm_submit2(ti_g, a, 0);
         if (ti_u>=0) ggml_tm_submit2(ti_u, a, 0);
         if (ti_d>=0) ggml_tm_submit2(ti_d, a, 0); }
-        atomic_fetch_add(&g_tm_swaps, 1);
+        tm_add64(&g_tm_swaps, 1);
     }
-    pthread_mutex_unlock(&g_tm_mtx);
+    tm_mutex_unlock(&g_tm_mtx);
     for (int t = 0; t < n_tokens; t++) for (int j = 0; j < K; j++) out[t*K+j] = g_tm_ewin[L][j];
 }
 
@@ -2836,7 +2905,7 @@ static void ggml_tm_ensure(const struct ggml_tensor * src0, const int64_t * row_
     }
     if (g_tm_R < 0 || g_tm_pool_n == 0) return;
     if (g_tm_R < 0 || g_tm_pool_n == 0) return;
-    atomic_fetch_add(&g_tm_hook_calls, 1);
+    tm_add64(&g_tm_hook_calls, 1);
     int ti = -1;
     for (int i = 0; i < g_tm_pool_n; i++) {
         if (g_tm_pool[i].data == src0->data) { ti = i; break; }
@@ -2844,12 +2913,12 @@ static void ggml_tm_ensure(const struct ggml_tensor * src0, const int64_t * row_
     if (ti < 0 || g_tm_pool[ti].n_experts != n_as) {
         // an expert matmul the pool cannot see would compute on evicted (zero-filled)
         // weights -- that must be loud, not a silently-fast bogus regime
-        atomic_fetch_add(&g_tm_hook_miss, 1);
+        tm_add64(&g_tm_hook_miss, 1);
         return;
     }
     struct ggml_tm_pool_tensor * t = &g_tm_pool[ti];
 
-    pthread_mutex_lock(&g_tm_mtx);
+    tm_mutex_lock(&g_tm_mtx);
 
     int needed_count = 0;
     t->op_seq++;
@@ -2961,7 +3030,7 @@ static void ggml_tm_ensure(const struct ggml_tensor * src0, const int64_t * row_
         }
     }
 
-    pthread_mutex_unlock(&g_tm_mtx);
+    tm_mutex_unlock(&g_tm_mtx);
 }
 
 // ---- compute-side API (called by every thread of mul_mat_id) ----------------
@@ -2983,11 +3052,11 @@ static struct ggml_tm_pool_tensor * ggml_tm_lookup(const void * data, int n_as) 
 // the next ensure of this tensor cannot run until this op's node completes), so a stale
 // read can only cause a harmless slow-path entry.
 static void ggml_tm_wait_expert(struct ggml_tm_pool_tensor * t, int e, int ith) {
-    if (__atomic_load_n(&t->state[e], __ATOMIC_ACQUIRE) == GGML_TM_RESIDENT) {
+    if (tm_load8_acq(&t->state[e]) == GGML_TM_RESIDENT) {
         return;
     }
     struct timespec tw0, tw1;
-    clock_gettime(CLOCK_MONOTONIC, &tw0);
+    tm_clock(&tw0);
     // Bounded spin before sleeping: the expected residual wait after overlap is only
     // ~100-300 us, so a futex sleep/wake round-trip (tens of us) is pure overhead on
     // almost every wait. Poll the readiness flag; fall back to the condvar only if the
@@ -2995,13 +3064,13 @@ static void ggml_tm_wait_expert(struct ggml_tm_pool_tensor * t, int e, int ith) 
     bool resident = false;
     for (;;) {
         for (int i = 0; i < 4000; i++) {
-            if (__atomic_load_n(&t->state[e], __ATOMIC_ACQUIRE) == GGML_TM_RESIDENT) {
+            if (tm_load8_acq(&t->state[e]) == GGML_TM_RESIDENT) {
                 resident = true;
                 break;
             }
         }
         if (resident) break;
-        clock_gettime(CLOCK_MONOTONIC, &tw1);
+        tm_clock(&tw1);
         uint64_t ns = (uint64_t)(tw1.tv_sec - tw0.tv_sec) * 1000000000ull
                       + (uint64_t)(tw1.tv_nsec - tw0.tv_nsec);
         // Spin budget: during a gate wait ALL compute threads are stalled -- the cores
@@ -3021,16 +3090,16 @@ static void ggml_tm_wait_expert(struct ggml_tm_pool_tensor * t, int e, int ith) 
         }
     }
     if (!resident) {
-        pthread_mutex_lock(&g_tm_mtx);
+        tm_mutex_lock(&g_tm_mtx);
         while (t->state[e] != GGML_TM_RESIDENT) {
-            pthread_cond_wait(&g_tm_done_cv, &g_tm_mtx);
+            tm_cond_wait(&g_tm_done_cv, &g_tm_mtx);
         }
-        pthread_mutex_unlock(&g_tm_mtx);
+        tm_mutex_unlock(&g_tm_mtx);
     }
-    clock_gettime(CLOCK_MONOTONIC, &tw1);
+    tm_clock(&tw1);
     tm_ev(tm_us(&tw0), tm_us(&tw1) - tm_us(&tw0), ith, 1 /*WAIT*/, t->layer_id, e);
     if (ith == 0) {   // one thread's stall is THE op stall; summing all would overcount
-        atomic_fetch_add(&g_tm_wait_ns, (uint64_t)(tw1.tv_sec - tw0.tv_sec) * 1000000000ull
+        tm_add64(&g_tm_wait_ns, (uint64_t)(tw1.tv_sec - tw0.tv_sec) * 1000000000ull
                                         + (uint64_t)(tw1.tv_nsec - tw0.tv_nsec));
     }
 }
@@ -3046,13 +3115,13 @@ void ggml_tm_wait_src_expert(const struct ggml_tensor * src0, int e, int ith) {
         struct ggml_tm_pool_tensor * t = &g_tm_pool[i];
         if (t->data != src0->data) continue;
         if (e < 0 || e >= t->n_experts) return;
-        if (__atomic_load_n(&t->state[e], __ATOMIC_ACQUIRE) != GGML_TM_RESIDENT) {
-            pthread_mutex_lock(&g_tm_mtx);
+        if (tm_load8_acq(&t->state[e]) != GGML_TM_RESIDENT) {
+            tm_mutex_lock(&g_tm_mtx);
             if (t->state[e] == GGML_TM_ABSENT) {
                 if (g_tm_fused && t->layer_id >= 0) { ggml_tm_submit_fused(t->layer_id, e); }
                 else                               { ggml_tm_submit(i, e); }
             }
-            pthread_mutex_unlock(&g_tm_mtx);
+            tm_mutex_unlock(&g_tm_mtx);
             ggml_tm_wait_expert(t, e, ith);
         }
         return;

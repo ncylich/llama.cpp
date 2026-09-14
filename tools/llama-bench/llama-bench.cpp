@@ -18,7 +18,19 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#if defined(_WIN32)
+#include <io.h>        // _chsize_s/_fseeki64 for the repacked side-file generator
+#define tm_fseeko  _fseeki64
+#define tm_ftello  _ftelli64
+#define tm_ftruncate(f, sz) _chsize_s(_fileno(f), (long long) (sz))
+typedef int64_t tm_off_t;   // off_t is 32-bit on MSVC; the side-file is 6 GB
+#else
 #include <unistd.h>   // ftruncate for the repacked side-file generator
+#define tm_fseeko  fseeko
+#define tm_ftello  ftello
+#define tm_ftruncate(f, sz) ftruncate(fileno(f), sz)
+typedef off_t tm_off_t;
+#endif
 
 #include "arg.h"
 #include "build-info.h"
@@ -2198,12 +2210,12 @@ static int tm_repack_dump(const char * model_path, const char * out_path) {
     FILE * out = fopen(out_path, "w+b");   // w+ : the fused pass reads the mirror region back
     if (!in || !out) { fprintf(stderr, "repack-dump: open failed\n"); return 1; }
     // size the side-file to the gguf so every tensor offset is valid (holes stay sparse)
-    fseeko(in, 0, SEEK_END);
+    tm_fseeko(in, 0, SEEK_END);
     // +4096 of slack: the last expert slice is rounded UP to a 4K boundary and would
     // otherwise run past the end of a file sized exactly like the gguf.
-    const off_t gguf_sz = ftello(in);
-    off_t fsize = gguf_sz + 4096;
-    if (ftruncate(fileno(out), fsize) != 0) { fprintf(stderr, "repack-dump: ftruncate failed\n"); return 1; }
+    const tm_off_t gguf_sz = tm_ftello(in);
+    tm_off_t fsize = gguf_sz + 4096;
+    if (tm_ftruncate(out, fsize) != 0) { fprintf(stderr, "repack-dump: ftruncate failed\n"); return 1; }
 
     int64_t n = gguf_get_n_tensors(ctx);
     int64_t n_done = 0;
@@ -2239,7 +2251,7 @@ static int tm_repack_dump(const char * model_path, const char * out_path) {
         const int64_t ne0   = t->ne[0];
         const int64_t nrows = t->ne[1] * t->ne[2] * t->ne[3];
         std::vector<char> plain(nb), rep(nb);
-        if (fseeko(in, gguf_off, SEEK_SET) != 0 || fread(plain.data(), 1, nb, in) != nb) {
+        if (tm_fseeko(in, (tm_off_t) gguf_off, SEEK_SET) != 0 || fread(plain.data(), 1, nb, in) != nb) {
             fprintf(stderr, "repack-dump: read %s failed\n", name); return 1;
         }
         int rc = ggml_temporal_repack_q4_0(rep.data(), plain.data(), ne0, nrows);
@@ -2248,7 +2260,7 @@ static int tm_repack_dump(const char * model_path, const char * out_path) {
                     name, rc, (long long) ne0, (long long) nrows);
             return 1;
         }
-        if (fseeko(out, off, SEEK_SET) != 0 || fwrite(rep.data(), 1, nb, out) != nb) {
+        if (tm_fseeko(out, (tm_off_t) off, SEEK_SET) != 0 || fwrite(rep.data(), 1, nb, out) != nb) {
             fprintf(stderr, "repack-dump: write %s failed\n", name); return 1;
         }
         {   // remember where this slice went, for the fused region below
@@ -2279,7 +2291,7 @@ static int tm_repack_dump(const char * model_path, const char * out_path) {
         for (auto & kv : slices) { n_exp = kv.second.n_exp; ebytes = kv.second.ebytes; break; }
         if (n_layers == 0 || n_exp == 0) { fprintf(stderr, "repack-dump: no expert layers found\n"); return 1; }
         const size_t fused_bytes = (size_t) n_layers * n_exp * 3 * ebytes;
-        if (ftruncate(fileno(out), (off_t)(fused_base + fused_bytes)) != 0) {
+        if (tm_ftruncate(out, (tm_off_t)(fused_base + fused_bytes)) != 0) {
             fprintf(stderr, "repack-dump: ftruncate(fused) failed\n"); return 1;
         }
         std::vector<char> tmp(ebytes);
@@ -2294,13 +2306,13 @@ static int tm_repack_dump(const char * model_path, const char * out_path) {
                 }
                 for (int e = 0; e < n_exp; e++) {
                     // read back the already-repacked slice from the mirror region
-                    if (fseeko(out, (off_t)(it->second.off + (size_t) e * ebytes), SEEK_SET) != 0 ||
+                    if (tm_fseeko(out, (tm_off_t)(it->second.off + (size_t) e * ebytes), SEEK_SET) != 0 ||
                         fread(tmp.data(), 1, ebytes, out) != ebytes) {
                         fprintf(stderr, "repack-dump: fused read-back failed L%d s%d e%d\n", L, sl, e); return 1;
                     }
                     const size_t dst = fused_base
                         + ((size_t) L * n_exp + (size_t) e) * 3 * ebytes + (size_t) sl * ebytes;
-                    if (fseeko(out, (off_t) dst, SEEK_SET) != 0 ||
+                    if (tm_fseeko(out, (tm_off_t) dst, SEEK_SET) != 0 ||
                         fwrite(tmp.data(), 1, ebytes, out) != ebytes) {
                         fprintf(stderr, "repack-dump: fused write failed L%d s%d e%d\n", L, sl, e); return 1;
                     }

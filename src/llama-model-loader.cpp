@@ -9,6 +9,11 @@
 #if defined(__linux__)
 #include <fcntl.h>   // open() the repacked expert side-file for the temporal pool
 #include <unistd.h>
+#define tm_dup dup
+#elif defined(_WIN32)
+#include <io.h>      // _open/_dup: CRT descriptors for the temporal pool's side-file
+#include <fcntl.h>
+#define tm_dup _dup
 #endif
 
 #include <algorithm>
@@ -1889,7 +1894,7 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_buffer_get_type(cur->buffer) != nullptr &&
                 strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)), "CPU_REPACK") == 0;
             if (ggml_backend_buffer_is_host(cur->buffer) || tm_repack_exps) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
                 // temporal slot-pool: with --mmap 0 and experts overridden to a plain
                 // CPU buffer (-ot "_exps=CPU"), expert tensors land here in anonymous
                 // memory. Register them for explicit pread/madvise residency control.
@@ -1936,13 +1941,17 @@ bool llama_model_loader::load_all_data(
                         ggml_temporal_pool_set_fused_base(((size_t) file->size() + 4096 + 4095) & ~(size_t) 4095);
                     }
                     if (side && side[0]) {
+#if defined(_WIN32)
+                        static int side_fd = _open(side, _O_RDONLY | _O_BINARY);
+#else
                         static int side_fd = open(side, O_RDONLY);
+#endif
                         if (side_fd < 0) {
                             throw std::runtime_error(format("failed to open LLAMA_TEMPORAL_REPACK_FILE '%s': %s", side, strerror(errno)));
                         }
-                        reg_fd = dup(side_fd);
+                        reg_fd = tm_dup(side_fd);
                     } else {
-                        reg_fd = dup(file->file_id());
+                        reg_fd = tm_dup(file->file_id());
                     }
                     // Side-file slices are 4K-aligned (same rule the dump tool applies) so
                     // the pool can O_DIRECT DMA straight into the slot with no bounce memcpy.
