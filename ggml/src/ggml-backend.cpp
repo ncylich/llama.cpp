@@ -2222,13 +2222,59 @@ static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *)data;
 }
 
+// ---- temporal slot-pool: reserve-mode CPU buffers (Windows) --------------------------------
+// See ggml-backend.h. A reserved buffer is tracked here so free/commit know it is not heap memory.
+#define GGML_CPU_RESERVED_MAX 64
+static struct { void * ptr; size_t size; } g_cpu_reserved[GGML_CPU_RESERVED_MAX];
+static int  g_cpu_reserved_n = 0;
+static bool g_cpu_reserve_mode = false;
+
+void ggml_backend_cpu_reserve_mode(bool on) {
+    g_cpu_reserve_mode = on;
+}
+
+static int ggml_backend_cpu_reserved_index(const void * ptr) {
+    for (int i = 0; i < g_cpu_reserved_n; i++) {
+        if (g_cpu_reserved[i].ptr == ptr) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void ggml_backend_cpu_buffer_commit(ggml_backend_buffer_t buffer, const void * ptr, size_t size) {
+#if defined(_WIN32)
+    if (!buffer || ggml_backend_cpu_reserved_index(buffer->context) < 0 || size == 0) {
+        return;
+    }
+    uintptr_t a = (uintptr_t) ptr & ~(uintptr_t) 4095;
+    uintptr_t b = ((uintptr_t) ptr + size + 4095) & ~(uintptr_t) 4095;
+    if (!VirtualAlloc((void *) a, (size_t) (b - a), MEM_COMMIT, PAGE_READWRITE)) {
+        GGML_LOG_ERROR("%s: failed to commit %zu bytes of a reserved weight buffer (error %lu; job memory limit?)\n",
+                       __func__, (size_t) (b - a), (unsigned long) GetLastError());
+        GGML_ABORT("temporal: commit refused; the model does not fit the memory cap");
+    }
+#else
+    GGML_UNUSED(buffer); GGML_UNUSED(ptr); GGML_UNUSED(size);
+#endif
+}
+
 static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+#if defined(_WIN32)
+    int idx = ggml_backend_cpu_reserved_index(buffer->context);
+    if (idx >= 0) {
+        VirtualFree(buffer->context, 0, MEM_RELEASE);
+        g_cpu_reserved[idx] = g_cpu_reserved[--g_cpu_reserved_n];
+        return;
+    }
+#endif
     ggml_aligned_free(buffer->context, buffer->size);
 }
 
 static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
+    ggml_backend_cpu_buffer_commit(buffer, (char *)tensor->data + offset, size);
     memset((char *)tensor->data + offset, value, size);
 
     GGML_UNUSED(buffer);
@@ -2236,6 +2282,7 @@ static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, 
 
 static void ggml_backend_cpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
+    ggml_backend_cpu_buffer_commit(buffer, (char *)tensor->data + offset, size);
     memcpy((char *)tensor->data + offset, data, size);
 
     GGML_UNUSED(buffer);
@@ -2251,6 +2298,7 @@ static void ggml_backend_cpu_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(src);
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_cpu_buffer_commit(buffer, dst->data, ggml_nbytes(src));
         memcpy(dst->data, src->data, ggml_nbytes(src));
         return true;
     }
@@ -2260,6 +2308,7 @@ static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 }
 
 static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cpu_buffer_commit(buffer, buffer->context, buffer->size);
     GGML_ASSERT(buffer);
     memset(buffer->context, value, buffer->size);
 }
@@ -2303,7 +2352,21 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data = NULL;
+#if defined(_WIN32)
+    if (g_cpu_reserve_mode && size >= ((size_t) 1 << 30) && g_cpu_reserved_n < GGML_CPU_RESERVED_MAX) {
+        data = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
+        if (data) {
+            g_cpu_reserved[g_cpu_reserved_n].ptr  = data;
+            g_cpu_reserved[g_cpu_reserved_n].size = size;
+            g_cpu_reserved_n++;
+            GGML_LOG_INFO("%s: temporal: reserved (uncommitted) CPU buffer of %.1f MiB; pages commit on write\n",
+                          __func__, size / 1048576.0);
+            return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
+        }
+    }
+#endif
+    data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);

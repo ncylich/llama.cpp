@@ -1569,7 +1569,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+#if defined(_WIN32)
+                // temporal slot-pool: weight buffers are reserved, not committed, so a job-object
+                // commit limit measures streamed residency (see ggml-backend.h). Only while the
+                // pool is configured, and only for the weight allocation.
+                const bool tm_reserve = getenv("LLAMA_TEMPORAL_R") != nullptr;
+                if (tm_reserve) { ggml_backend_cpu_reserve_mode(true); }
+#endif
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+#if defined(_WIN32)
+                if (tm_reserve) { ggml_backend_cpu_reserve_mode(false); }
+#endif
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

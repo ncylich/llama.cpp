@@ -1924,6 +1924,7 @@ bool llama_model_loader::load_all_data(
                         file->read_raw(tmp.data(), n_size);
                         ggml_backend_tensor_set(cur, tmp.data(), 0, n_size);
                     } else {
+                        ggml_backend_cpu_buffer_commit(cur->buffer, cur->data, n_size);   // Windows reserve-mode buffers
                         file->seek(weight->offs, SEEK_SET);
                         file->read_raw(cur->data, n_size);
                     }

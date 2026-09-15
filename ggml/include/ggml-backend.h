@@ -430,6 +430,14 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // temporal slot-pool, Windows only (no-ops elsewhere): while reserve mode is on, CPU buffers
+    // of 1 GiB or more are VirtualAlloc(MEM_RESERVE)d instead of committed, and every write path
+    // into them commits the pages it touches, so a job-object commit limit measures residency
+    // (the streamed experts) rather than the allocation. The model loader raises the flag around
+    // its weight-buffer allocation only; compute and KV buffers are unaffected.
+    GGML_API void ggml_backend_cpu_reserve_mode(bool on);
+    GGML_API void ggml_backend_cpu_buffer_commit(ggml_backend_buffer_t buffer, const void * ptr, size_t size);
+
 #ifdef  __cplusplus
 }
 #endif
