@@ -223,7 +223,9 @@ static inline void tm_decommit_region(void * p, size_t len) {
         if (!VirtualFree((void *) a, (size_t) (b - a), MEM_DECOMMIT)) {
             fprintf(stderr, "temporal-pool: decommit of a lazy expert tensor failed (%lu); commit charge stays at full size\n", (unsigned long) GetLastError());
         }
-    } else {
+    } else if (!(mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE)) {
+        // MEM_RESERVE is the expected state under reserve-mode weight buffers (nothing to do);
+        // anything else means the buffer is not ours to decommit and commit charge stays whole.
         fprintf(stderr, "temporal-pool: expert tensor memory is not a committed private region (state=%lx type=%lx); not decommitting\n",
                 (unsigned long) mbi.State, (unsigned long) mbi.Type);
     }
