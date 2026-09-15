@@ -3373,7 +3373,7 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
         // ENFORCED 1-swap policy: replace the (degenerate random-weight) router
         // selection with the per-layer resident window, advanced by exactly one random
         // swap per layer per token (on the gate op). Decode only (one token row).
@@ -3414,7 +3414,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     // temporal slot-pool: iterate experts in the ensure-built order (resident first,
     // in-flight last) and synchronize per expert -- resident-expert GEMVs run while the
     // missing experts' bytes stream in; the fetched expert is computed last.
@@ -3422,7 +3422,7 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
 
     for (int ia = 0; ia < n_as; ++ia) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
         const int cur_a = tm_entry ? tm_entry->order[ia] : ia;
 #else
         const int cur_a = ia;
@@ -3433,7 +3433,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
         if (tm_entry) {
             ggml_tm_wait_expert(tm_entry, cur_a, ith);
         }
