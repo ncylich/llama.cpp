@@ -176,23 +176,57 @@ static inline void tm_close_fd(int fd) { _close(fd); }
 static inline int  tm_aligned_alloc(void ** pp, size_t sz) { *pp = _aligned_malloc(sz, 4096); return *pp ? 0 : -1; }
 static inline void tm_aligned_free(void * p)                { _aligned_free(p); }
 
-// madvise(MADV_DONTNEED | MADV_FREE) -> DiscardVirtualMemory: the pages leave the working
-// set and read back as zero on the next touch; the refetch overwrites them in place.
-// LLAMA_TEMPORAL_MADV_FREE keeps its name on Windows but both flavours are this one call.
-// Resolved at run time because the SDK header hides it below _WIN32_WINNT 0x0603.
-typedef DWORD (WINAPI * tm_discard_fn)(PVOID, SIZE_T);
+// Eviction and residency on Windows work on COMMIT, not just on the working set.
+//
+// Why not DiscardVirtualMemory (the literal MADV_DONTNEED analogue): ggml allocates the
+// whole expert buffer with _aligned_malloc, and Windows charges commit for every committed
+// page whether or not it was ever touched. The lazy loader never reads absent experts, but
+// the 5.3 GB buffer is still committed, so a job-object commit limit of 4 GB refused the
+// DEPLOY configuration as well as the ceiling (measured: deploy peak commit 5963 MiB against
+// a peak working set of 823 MiB). On Linux the cgroup bounds RSS and untouched pages cost
+// nothing, so this never arose there.
+//
+// So on Windows an ABSENT expert slot is DECOMMITTED: at registration for lazy tensors
+// (R < n_experts), and again at eviction; a fetch COMMITS the destination pages before the
+// read. Commit charge then equals resident experts + non-expert weights, which is exactly
+// the memory claim the cap is meant to test. The heap's own 5.3 GB region stays reserved
+// (VirtualFree MEM_DECOMMIT inside a heap virtual block is legal; the block header page is
+// never inside an expert's aligned interior). Consequences, recorded in the ledger:
+//   - MADV_FREE and MADV_DONTNEED both map to decommit; a refetch pays commit + zero-fill
+//     page faults, i.e. the DONTNEED cost model, never FREE's overwrite-in-place.
+//   - computing on an evicted expert faults (access violation) instead of reading zeros:
+//     the residency barrier is now enforced by the MMU, louder than the Linux version.
 static inline void tm_madvise(void * addr, size_t len, int use_free) {
-    static tm_discard_fn fn = NULL;
-    static int resolved = 0;
     (void) use_free;
-    if (!resolved) {
-        resolved = 1;
-        HMODULE k32 = GetModuleHandleA("kernel32.dll");
-        if (k32) { fn = (tm_discard_fn) (void *) GetProcAddress(k32, "DiscardVirtualMemory"); }
-        if (!fn) { fprintf(stderr, "temporal-pool: DiscardVirtualMemory unavailable, eviction falls back to VirtualAlloc(MEM_RESET)\n"); }
+    if (!VirtualFree(addr, len, MEM_DECOMMIT)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "temporal-pool: VirtualFree(MEM_DECOMMIT) failed (%lu); falling back to MEM_RESET\n", (unsigned long) GetLastError()); }
+        VirtualAlloc(addr, len, MEM_RESET, PAGE_READWRITE);
     }
-    if (fn) { fn(addr, len); }
-    else    { VirtualAlloc(addr, len, MEM_RESET, PAGE_READWRITE); }
+}
+// commit the pages covering [p, p+len) before a fetch writes them (idempotent on committed pages)
+static inline void tm_commit(void * p, size_t len) {
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) 4095;
+    uintptr_t b = ((uintptr_t) p + len + 4095) & ~(uintptr_t) 4095;
+    if (!VirtualAlloc((void *) a, (size_t) (b - a), MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "temporal-pool: FATAL VirtualAlloc(MEM_COMMIT, %zu bytes) failed (%lu)\n", (size_t) (b - a), (unsigned long) GetLastError());
+        abort();
+    }
+}
+// decommit the page-aligned interior of a whole lazy expert tensor at registration
+static inline void tm_decommit_region(void * p, size_t len) {
+    uintptr_t a = ((uintptr_t) p + 4095) & ~(uintptr_t) 4095;
+    uintptr_t b = ((uintptr_t) p + len) & ~(uintptr_t) 4095;
+    if (b <= a) { return; }
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void *) a, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE) {
+        if (!VirtualFree((void *) a, (size_t) (b - a), MEM_DECOMMIT)) {
+            fprintf(stderr, "temporal-pool: decommit of a lazy expert tensor failed (%lu); commit charge stays at full size\n", (unsigned long) GetLastError());
+        }
+    } else {
+        fprintf(stderr, "temporal-pool: expert tensor memory is not a committed private region (state=%lx type=%lx); not decommitting\n",
+                (unsigned long) mbi.State, (unsigned long) mbi.Type);
+    }
 }
 
 // LLAMA_TEMPORAL_WORKER_AFFINITY "lo-hi": sched_setaffinity -> SetThreadAffinityMask
@@ -259,4 +293,6 @@ typedef off_t   tm_off_t;
 #define tm_aligned_alloc(pp, sz) posix_memalign(pp, 4096, sz)
 #define tm_aligned_free(p)      free(p)
 #define tm_madvise(addr, len, use_free) madvise(addr, len, (use_free) ? MADV_FREE : MADV_DONTNEED)
+#define tm_commit(p, len)               ((void) 0)   // anonymous memory is always committed on Linux
+#define tm_decommit_region(p, len)      ((void) 0)
 #endif

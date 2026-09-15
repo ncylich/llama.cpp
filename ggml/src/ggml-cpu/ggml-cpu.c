@@ -1830,6 +1830,7 @@ TM_THREAD_FN(ggml_tm_worker) {
         size_t    ebeg = t->file_off + (size_t) e * t->expert_bytes + plo;
         uint8_t * dst  = (uint8_t *) t->data + (size_t) e * t->expert_bytes + plo;
         size_t    sub_bytes = phi - plo;
+        tm_commit(dst, sub_bytes);   // Windows: commit the slot's pages before the read (no-op on Linux)
         // FUSED fetch: one request delivers the whole [gate|up|down] triple, scattered by
         // preadv directly into the three destination slots. 648 KiB in one device request
         // instead of six 108 KiB ones: 828 -> 678 us mean, 3248 -> 881 us worst (S3-28b).
@@ -1877,6 +1878,7 @@ TM_THREAD_FN(ggml_tm_worker) {
                 done += (size_t) r;
             }
             for (int k = 0; k < 3; k++) {
+                tm_commit((uint8_t *) g_tm_pool[fti[k]].data + (size_t) e * g_tm_pool[fti[k]].expert_bytes, t->expert_bytes);
                 memcpy((uint8_t *) g_tm_pool[fti[k]].data + (size_t) e * g_tm_pool[fti[k]].expert_bytes,
                        bounce + (size_t) k * t->expert_bytes, t->expert_bytes);
             }
@@ -2541,6 +2543,11 @@ void ggml_temporal_pool_register(void * data, size_t nbytes, int n_experts, int 
             // full-model anonymous transient that OOM-panicked the 7.7 GB Pixel.
             t->fifo_len   = 0;
             t->n_resident = 0;               // state[] is calloc'd = GGML_TM_ABSENT
+#if defined(_WIN32)
+            // Windows: commit charge must follow residency (see temporal-port.h); every
+            // absent slot is decommitted now and committed again by the fetch that fills it.
+            tm_decommit_region(data, nbytes);
+#endif
         } else {
             t->fifo_len   = n_experts;       // ceiling: loader read everything; all
             t->n_resident = n_experts;       // resident and in the ring for trim
