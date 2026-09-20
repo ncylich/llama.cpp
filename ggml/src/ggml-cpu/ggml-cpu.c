@@ -2873,23 +2873,6 @@ void ggml_temporal_window_fill(struct ggml_tensor * dst, int ith, int nth, void 
             if (ti_d>=0) ggml_tm_submit2(ti_d, j, 0); }
         }
         g_tm_ewin_k[L] = K;
-        // TRIM AFTER PREFILL: a context prefill (llama-bench -d, or any prompt) runs through the
-        // single-pass repacked path, which fetches on miss and never evicts (pitfall #25), so
-        // every expert the prefill touched is still resident when decode starts: 2.5 GiB at
-        // depth 1024 and 3.3 GiB at depth 4096 against 0.8 GiB at depth 0 (laptop L1-6). The
-        // window is the residency claim (R = top_k), so evict everything outside it once, here.
-        // Only for streamed configurations (R < E): a fully resident control keeps its experts.
-        // LLAMA_TEMPORAL_TRIM=0 disables it (value-parsed), for the A/B that prices it.
-        static int trim = -1;
-        if (trim < 0) { const char * v = getenv("LLAMA_TEMPORAL_TRIM"); trim = (v && !atoi(v)) ? 0 : 1; }
-        if (trim && g_tm_R < E) {
-            for (int e = 0; e < E; e++) {
-                if (g_tm_ein[L][e]) continue;
-                if (ti_g>=0) ggml_tm_evict(&g_tm_pool[ti_g], e);
-                if (ti_u>=0) ggml_tm_evict(&g_tm_pool[ti_u], e);
-                if (ti_d>=0) ggml_tm_evict(&g_tm_pool[ti_d], e);
-            }
-        }
     } else {
         int s = (int)(ggml_tm_lrand(L) % (uint64_t)(K > 1 ? K-1 : 1));   // evict a resident (0..K-2)
         int a; do { a = (int)(ggml_tm_lrand(L) % (uint64_t)E); } while (g_tm_ein[L][a]);
@@ -2905,6 +2888,26 @@ void ggml_temporal_window_fill(struct ggml_tensor * dst, int ith, int nth, void 
         if (ti_u>=0) ggml_tm_submit2(ti_u, a, 0);
         if (ti_d>=0) ggml_tm_submit2(ti_d, a, 0); }
         tm_add64(&g_tm_swaps, 1);
+    }
+    // TRIM TO THE WINDOW: a context prefill (llama-bench -d, any prompt) runs through the
+    // single-pass repacked path, which fetches on miss and never evicts (pitfall #25), so when
+    // decode resumes every expert the prefill touched is still resident: 2.5 GiB at depth 1024,
+    // 3.3 GiB at depth 4096 against 0.8 GiB at depth 0 (laptop L1-6). llama-bench decodes a
+    // warmup token BEFORE the depth prefill and re-prefills every rep, so this cannot be tied to
+    // the window's first fill; it fires whenever this layer holds more residents than the window
+    // (K, plus one in flight). Streamed configurations only (R < E); a fully resident control
+    // keeps its experts. LLAMA_TEMPORAL_TRIM=0 disables it (value-parsed) for the A/B.
+    {
+        static int trim = -1;
+        if (trim < 0) { const char * v = getenv("LLAMA_TEMPORAL_TRIM"); trim = (v && !atoi(v)) ? 0 : 1; }
+        if (trim && g_tm_R < E && ti_g >= 0 && g_tm_pool[ti_g].n_resident > K + 1) {
+            for (int e = 0; e < E; e++) {
+                if (g_tm_ein[L][e]) continue;
+                if (ti_g>=0) ggml_tm_evict(&g_tm_pool[ti_g], e);
+                if (ti_u>=0) ggml_tm_evict(&g_tm_pool[ti_u], e);
+                if (ti_d>=0) ggml_tm_evict(&g_tm_pool[ti_d], e);
+            }
+        }
     }
     tm_mutex_unlock(&g_tm_mtx);
     for (int t = 0; t < n_tokens; t++) for (int j = 0; j < K; j++) out[t*K+j] = g_tm_ewin[L][j];
